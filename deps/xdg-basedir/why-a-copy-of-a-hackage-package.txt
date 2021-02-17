@@ -1,0 +1,3 @@
+This implements a slight extensions of the XDG Basedir spec that adds a "state"
+directory for stuff that doesn't neatly fit into the other specified
+categories.
