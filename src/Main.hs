@@ -279,6 +279,11 @@ guiThread ctx = do
 	vbox <- vBoxNew False 0
 	set window [windowTitle := string "wow", containerChild := vbox]
 
+	gameLabel <- labelNew . Just . pGame . ctxProfile $ ctx
+	targetLabel <- labelNew . Just . ("Target: " <>) . pTarget . ctxProfile $ ctx
+
+	updateTimerLabel ctx
+
 	eventLog <- treeViewNewWithModel (ctxEventStore ctx)
 	let newColumn :: GlibString string => (Event -> IO string) -> IO Int
 	    newColumn = addColumnPlainText eventLog (ctxEventStore ctx)
@@ -305,8 +310,8 @@ guiThread ctx = do
 	set eventLogScroll [containerChild := eventLog, scrolledWindowHscrollbarPolicy := PolicyNever]
 	-- TODO: set minimum height to (length (major events) + 1) * height of one row
 
-	updateTimerLabel ctx
-
+	boxPackStart vbox gameLabel PackNatural 0
+	boxPackStart vbox targetLabel PackNatural 0
 	boxPackStart vbox (ctxUITimerLabel ctx) PackNatural 0
 	boxPackStart vbox eventLogScroll PackGrow 0
 	widgetShowAll window
