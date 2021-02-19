@@ -307,9 +307,13 @@ guiThread ctx = do
 					redrawAllIntervals ctx
 				pure content
 
+	-- TODO: set minimum height to (length (major events) + 1) * height of one row
 	eventLogScroll <- scrolledWindowNew Nothing Nothing
 	set eventLogScroll [containerChild := eventLog, scrolledWindowHscrollbarPolicy := PolicyNever]
-	-- TODO: set minimum height to (length (major events) + 1) * height of one row
+	eventLogAdjustment <- scrolledWindowGetVAdjustment eventLogScroll
+	-- TODO: disable jumping when position has been manually changed
+	onAdjChanged eventLogAdjustment $
+		adjustmentGetUpper eventLogAdjustment >>= adjustmentSetValue eventLogAdjustment
 
 	boxPackStart vbox gameLabel PackNatural 0
 	boxPackStart vbox targetLabel PackNatural 0
