@@ -17,6 +17,7 @@ import Data.Char
 import Data.Default
 import Data.Foldable
 import Data.Functor.Alt ((<!>))
+import Data.Tree
 import Data.Int
 import Data.IORef
 import Data.List
@@ -67,7 +68,7 @@ data Context = Context
 	, ctxUITimerLabelStatus :: MVar TimerLabelStatus
 	, ctxUITimerLabel :: Label
 	, ctxTimeMagnitude :: IORef TimeMagnitude
-	, ctxEventStore :: ListStore Event
+	, ctxEventStore :: TreeStore Event
 	}
 
 initializeContext :: IO Context
@@ -87,7 +88,7 @@ initializeContext = do
 	uiTimerLabelStatus <- newMVar BlankTimer
 	uiTimerLabel <- labelNew (string <$> Nothing)
 	timeMagnitude <- newIORef (pDurationHint profile)
-	eventStore <- listStoreNew []
+	eventStore <- treeStoreNew []
 	pure Context
 		{ ctxConfig = config
 		, ctxProfile = profile
@@ -512,8 +513,8 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 			postGUIAsync $ do
 				case status of
 					RunningSince{} -> pure ()
-					_ -> listStoreClear (ctxEventStore ctx)
-				() <$ listStoreAppend (ctxEventStore ctx) event
+					_ -> treeStoreClear (ctxEventStore ctx)
+				logEvent ctx event
 
 			-- tell the parser thread
 			if eState event == pTarget (ctxProfile ctx)
@@ -544,6 +545,27 @@ roundUpToPowerOf2 n
 	go exp pow
 		| n <= pow = head [bit (e+1) | e <- [exp, exp-1 .. exp `rem` 2], testBit n e]
 		| otherwise = go (2*exp) (pow*pow)
+
+logEvent :: Context -> Event -> IO ()
+logEvent ctx e = do
+	n <- treeModelIterNChildren store Nothing
+	case pMajorStates (ctxProfile ctx) of
+		Just major | eState e `S.member` major -> do
+			es <- removeMinorEvents major [] (n-1)
+			n' <- treeModelIterNChildren store Nothing
+			treeStoreInsertTree store [] n' $ Node e [Node e' [] | e' <- es]
+		_ -> treeStoreInsert store [] n e
+	where
+	store = ctxEventStore ctx
+	removeMinorEvents major minor n
+		| n < 0 = pure minor
+		| otherwise = do
+			e' <- treeStoreGetValue store [n]
+			if eState e' `S.member` major
+			then pure minor
+			else do
+				treeStoreRemove store [n]
+				removeMinorEvents major (e':minor) (n-1)
 
 heartbeatThread :: Context -> IO ()
 heartbeatThread ctx = forever $ do
