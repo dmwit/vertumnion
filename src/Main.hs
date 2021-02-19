@@ -448,7 +448,7 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 					broadcast Event { eFrame = Just (dFrame+frame'), eTime = now, eState = state }
 						(Just splitKey)
 						(running dFrame frame')
-						idling
+						(stopping idling)
 				| otherwise -> do
 					let ddFrame = roundUpToPowerOf2 (max frame (if signed then -1-frame' else frame))
 					    signed = frame' < 0
@@ -462,9 +462,13 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 					broadcast Event { eFrame = Just (dFrame'+frame'), eTime = now, eState = state }
 						(Just splitKey)
 						(running dFrame' frame')
-						idling
+						(stopping idling)
 			Left (Just now) -> stopTimer now >> idling
 			Left Nothing -> running dFrame frame splitKey
+
+		stopping k = getEvent >>= \case
+			Left (Just now) -> k
+			_ -> stopping k
 
 		noFrames splitKey = do
 			(now, state) <- readChan (ctxInput ctx)
@@ -475,7 +479,7 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 			else broadcast Event { eFrame = Nothing, eTime = now, eState = state }
 				splitKey
 				(noFrames . Just)
-				(noFrames Nothing)
+				(stopping (noFrames Nothing))
 
 		broadcast event splitKey continue won = do
 			-- tell the database
