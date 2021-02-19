@@ -56,6 +56,7 @@ main = do
 	ctx <- initializeContext
 	traverse_ (\thread -> forkIO (thread ctx)) [loggingThread, stdinThread, parserThread, heartbeatThread]
 	guiThread ctx -- NB not forked
+	-- TODO: maybe stay open and start ignoring stdin, so that pipes don't fill up and block producers?
 
 data Context = Context
 	{ ctxConfig :: Config
