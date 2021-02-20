@@ -29,6 +29,7 @@ import Data.Time
 import Data.Time.Calendar.OrdinalDate
 import Data.Word
 import Graphics.UI.Gtk
+import Options.Applicative
 import System.Directory
 import System.Environment
 import System.Environment.XDG.BaseDir
@@ -51,6 +52,7 @@ import qualified Data.Text.Read as T
 import qualified Database.PostgreSQL.Simple as DB
 import qualified Database.PostgreSQL.Simple.ToField as DB
 import qualified Database.PostgreSQL.Simple.Types as DB
+import qualified Text.PrettyPrint.ANSI.Leijen as Doc
 
 main :: IO ()
 main = do
@@ -73,14 +75,10 @@ data Context = Context
 
 initializeContext :: IO Context
 initializeContext = do
-	args <- getArgs
-	profileName <- case args of
-		["--help"] -> usage stdout >> exitWith ExitSuccess
-		["-h"] -> usage stdout >> exitWith ExitSuccess
-		["--", f] -> pure f
-		[f] -> pure f
-		_ -> usage stderr >> exitWith (ExitFailure 1)
-	profile <- loadProfile profileName
+	argumentParser <- mkArgumentParser
+	args <- execParser argumentParser
+	profile_ <- loadProfile (argProfile args)
+	let profile = profile_ { pTarget = fromMaybe (pTarget profile_) (argTargetOverride args) }
 	config <- loadConfig
 	errors <- newChan
 	input <- newChan
@@ -178,28 +176,6 @@ configName = configPath "config"
 logDir :: IO FilePath
 logDir = getUserStateDir "vertumnion"
 
-usage :: Handle -> IO ()
-usage h = do
-	prog <- getProgName
-	dir <- profileDir
-	fp <- configName
-	hPutStr h . unlines . tail $ [undefined
-		, "USAGE: " ++ prog ++ " [--] PROFILE"
-		, "Run a splits timer. Events are accepted on stdin."
-		, ""
-		, "PROFILE refers to a file in " ++ dir ++ "."
-		, "The profile should be in config-value format and use the UTF-8 encoding."
-		, "See here for details:"
-		, "http://hackage.haskell.org/package/config-value/docs/Config.html"
-		, ""
-		, "The profile should conform to the following format."
-		, show (C.generateDocs profileSpec)
-		, ""
-		, "A configuration file is also read from " ++ fp ++ "."
-		, "It is similarly a UTF-8 encoded config-value file, with the following format."
-		, show (C.generateDocs configSpec)
-		]
-
 loadSchema :: FilePath -> Handle -> C.ValueSpec a -> IO a
 loadSchema fp h spec = do
 	hSetEncoding h utf8
@@ -237,6 +213,52 @@ loadConfig = do
 	case mh of
 		Left (e :: IOError) -> pure def
 		Right h -> loadSchema fp h configSpec
+
+data Arguments = Arguments
+	{ argProfile :: FilePath
+	, argTargetOverride :: Maybe Text
+	} deriving (Eq, Ord, Read, Show)
+
+mkArgumentParser :: IO (ParserInfo Arguments)
+mkArgumentParser = do
+	desc <- usage
+	pure $ info (opts <**> helper)
+		(  fullDesc
+		<> progDesc "Run a splits timer. Events are accepted on stdin."
+		<> (footerDoc . Just . Doc.string) desc
+		)
+	where
+	opts = pure Arguments
+		<*> strArgument
+			(  metavar "PROFILE"
+			<> help "A description of the game being played"
+			)
+		<*> ( optional $ T.pack <$> strOption
+				(  long "target"
+				<> short 't'
+				<> metavar "EVENT"
+				<> help "Override the target given in the profile just for this run"
+				)
+			)
+
+usage :: IO String
+usage = do
+	prog <- getProgName
+	dir <- profileDir
+	fp <- configName
+	pure . unlines . tail $ [undefined
+		, "PROFILE refers to a file in " ++ dir ++ "."
+		, "The profile should be in config-value format and use the UTF-8 encoding."
+		, "See here for details:"
+		, "http://hackage.haskell.org/package/config-value/docs/Config.html"
+		, ""
+		, "The profile should conform to the following format."
+		, show (C.generateDocs profileSpec)
+		, ""
+		, "A configuration file is also read from " ++ fp ++ "."
+		, "It is similarly a UTF-8 encoded config-value file, with the following format."
+		, show (C.generateDocs configSpec)
+		]
 
 loggingThread :: Context -> IO loop
 loggingThread (ctxErrors -> chan) = do
