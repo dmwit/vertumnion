@@ -330,6 +330,19 @@ guiThread ctx = do
 				pure content
 
 	-- TODO: set minimum height to (length (major events) + 1) * height of one row
+	-- Hmm... from reading online a bit, there doesn't seem to be a really
+	-- great way to do this. Approaches:
+	--
+	-- * widgetSetSizeRequest -- can't resize the widget below this size
+	-- * scrolledWindowMinContentHeight -- can't resize the widget below this size
+	-- * windowSetDefaultSize -- kinda want to use the computed size of the
+	--   other widgets in the window, but that computation isn't done until the
+	--   window is shown, and after that the default size is ignored
+	-- * treeStoreInsertForest (to add blank rows and reserve space) -- the
+	--   ScrolledWindow doesn't pay attention to its child's size at all
+	--
+	-- Possible way forward: record what size the user put the window at last
+	-- time they used this profile.
 	eventLogScroll <- scrolledWindowNew Nothing Nothing
 	set eventLogScroll [containerChild := eventLog, scrolledWindowHscrollbarPolicy := PolicyNever]
 	eventLogAdjustment <- scrolledWindowGetVAdjustment eventLogScroll
