@@ -14,6 +14,7 @@ import Control.Monad.IO.Class
 import Data.Bits
 import Data.ByteString (ByteString)
 import Data.Char
+import Data.Containers.ListUtils
 import Data.Default
 import Data.Foldable
 import Data.Functor.Alt ((<!>))
@@ -28,6 +29,7 @@ import Data.Text (Text)
 import Data.Time
 import Data.Time.Calendar.OrdinalDate
 import Data.Word
+import Graphics.Rendering.Cairo (Render)
 import Graphics.UI.Gtk
 import Options.Applicative
 import System.Directory
@@ -52,6 +54,7 @@ import qualified Data.Text.Read as T
 import qualified Database.PostgreSQL.Simple as DB
 import qualified Database.PostgreSQL.Simple.ToField as DB
 import qualified Database.PostgreSQL.Simple.Types as DB
+import qualified Graphics.Rendering.Cairo as Cairo
 import qualified Text.PrettyPrint.ANSI.Leijen as Doc
 
 main :: IO ()
@@ -303,6 +306,7 @@ guiThread ctx = do
 	set window [windowTitle := string "wow", containerChild := vbox]
 
 	gameLabel <- labelNew . Just . pGame . ctxProfile $ ctx
+	-- TODO: Maybe it would be nice for the target to be editable
 	targetLabel <- labelNew . Just . ("Target: " <>) . pTarget . ctxProfile $ ctx
 
 	updateTimerLabel ctx
@@ -340,6 +344,7 @@ guiThread ctx = do
 	--   window is shown, and after that the default size is ignored
 	-- * treeStoreInsertForest (to add blank rows and reserve space) -- the
 	--   ScrolledWindow doesn't pay attention to its child's size at all
+	-- * sizeRequest -- this is an invalid signal for ScrolledWindows
 	--
 	-- Possible way forward: record what size the user put the window at last
 	-- time they used this profile.
@@ -350,10 +355,18 @@ guiThread ctx = do
 	onAdjChanged eventLogAdjustment $
 		adjustmentGetUpper eventLogAdjustment >>= adjustmentSetValue eventLogAdjustment
 
+	graph <- drawingAreaNew
+	widgetSetSizeRequest graph 200 200
+	on graph draw (renderGraph ctx)
+
+	dataPane <- vPanedNew
+	panedPack1 dataPane eventLogScroll True True
+	panedPack2 dataPane graph False True
+
 	boxPackStart vbox gameLabel PackNatural 0
 	boxPackStart vbox targetLabel PackNatural 0
 	boxPackStart vbox (ctxUITimerLabel ctx) PackNatural 0
-	boxPackStart vbox eventLogScroll PackGrow 0
+	boxPackStart vbox dataPane PackGrow 0
 	widgetShowAll window
 	mainGUI
 
@@ -370,6 +383,41 @@ addColumnPlainText treeView model showRow = do
 	treeViewColumnPackEnd col renderer False
 	cellLayoutSetAttributes col renderer model $ \row -> [cellText :=> showRow row]
 	treeViewAppendColumn treeView col
+
+renderGraph :: Context -> Render ()
+renderGraph ctx = do
+	(_, _, w, h) <- Cairo.clipExtents
+	if w < h
+		then Cairo.translate 0 ((h-w)/2) >> Cairo.scale w w
+		else Cairo.translate ((w-h)/2) 0 >> Cairo.scale h h
+	-- TODO: from here on out everything is terrible
+	eForest <- liftIO (treeStoreGetForest (ctxEventStore ctx))
+	let es = postOrder eForest
+	    states = nubOrd (eState <$> es)
+	when (hay $ drop 1 es) $ do
+		let a = head es
+		    z = last es
+		Cairo.setLineWidth 0.01
+		Cairo.scale (1/realToFrac (diffUTCTime (eTime z) (eTime a))) (1/fromIntegral (length states))
+		for_ es $ \e -> do
+			Cairo.arc
+				(realToFrac (diffUTCTime (eTime e) (eTime a)))
+				((fromIntegral . fromJust . findIndex (eState e ==)) states)
+				0.01
+				0
+				(2*pi)
+			Cairo.stroke
+
+treeStoreGetForest :: TreeStore a -> IO (Forest a)
+treeStoreGetForest s = do
+	n <- treeModelIterNChildren s Nothing
+	traverse (treeStoreGetTree s . pure) [0..n-1]
+
+postOrder :: Forest a -> [a]
+postOrder = concatMap postOrderTree where postOrderTree (Node a as) = postOrder as ++ [a]
+
+hay :: [a] -> Bool
+hay = not . null
 
 data TimeMagnitude = Seconds | Minutes | Hours | Days Word8 deriving (Eq, Ord, Read, Show)
 
@@ -520,6 +568,7 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 			then do
 				if isJust splitKey then stopTimer now else warnIgnoreStop
 				noFrames Nothing
+			-- TODO: complain about invalid states, like getEvent does
 			else broadcast Event { eFrame = Nothing, eTime = now, eState = state }
 				splitKey
 				(noFrames . Just)
