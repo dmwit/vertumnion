@@ -118,7 +118,6 @@ configSpec = C.sectionsSpec
 		}
 	help = "A postgres connection string for storing splits (default: dbname=vertumnion)"
 
--- TODO: provide a lightweight mechanism for overriding the target
 data Profile = Profile
 	{ pGame :: Text
 	, pFPS :: Maybe Double
@@ -447,7 +446,6 @@ instance DB.ToField a => DB.ToField (Defaultable a) where
 	toField (Defaultable (Just a)) = DB.toField a
 
 -- TODO: catch EOF and do something sensible (probably just quit?)
--- TODO: we need a third state, where we are ignoring events and waiting for a STOP
 parserThread :: Context -> IO loop
 parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 	go conn = case pFPS (ctxProfile ctx) of
