@@ -568,11 +568,15 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 			then do
 				if isJust splitKey then stopTimer now else warnIgnoreStop
 				noFrames Nothing
-			-- TODO: complain about invalid states, like getEvent does
-			else broadcast Event { eFrame = Nothing, eTime = now, eState = state }
+			else if ctxValidState ctx state
+			then broadcast Event { eFrame = Nothing, eTime = now, eState = state }
 				splitKey
 				(noFrames . Just)
 				(stopping (noFrames Nothing))
+			else do
+				writeChan (ctxErrors ctx)
+					(printf "Ignoring unknown state %s at time %s" (show state) (show now))
+				noFrames splitKey
 
 		broadcast event splitKey continue won = do
 			-- tell the database
