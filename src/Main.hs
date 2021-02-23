@@ -419,10 +419,10 @@ renderGraph ctx = do
 	if w < h
 		then Cairo.translate 0 ((h-w)/2) >> Cairo.scale w w
 		else Cairo.translate ((w-h)/2) 0 >> Cairo.scale h h
+	states <- liftIO (ctxStates ctx)
 	-- TODO: from here on out everything is terrible
 	eForest <- liftIO (treeStoreGetForest (ctxEventStore ctx))
 	let es = postOrder eForest
-	states <- liftIO (ctxStates ctx)
 	when (hay $ drop 1 es) $ do
 		let a = head es
 		    z = last es
