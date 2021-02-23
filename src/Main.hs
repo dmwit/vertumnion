@@ -3,14 +3,19 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE StandaloneDeriving #-}
 module Main where
 
 import Config.Schema (SectionsSpec, ValueSpec)
 import Control.Concurrent
 import Control.Concurrent.Chan
+import Control.Concurrent.STM
+import Control.Concurrent.STM.TVar
 import Control.Exception
 import Control.Monad
 import Control.Monad.IO.Class
+import Data.Bifunctor
 import Data.Bits
 import Data.ByteString (ByteString)
 import Data.Char
@@ -24,13 +29,16 @@ import Data.IORef
 import Data.List
 import Data.Map (Map)
 import Data.Maybe
+import Data.Ord
 import Data.Set (Set)
+import Data.Set.Ordered (OSet)
 import Data.Text (Text)
 import Data.Time
 import Data.Time.Calendar.OrdinalDate
 import Data.Word
 import Graphics.Rendering.Cairo (Render)
 import Graphics.UI.Gtk
+import Numeric.Natural
 import Options.Applicative
 import System.Directory
 import System.Environment
@@ -51,6 +59,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.Text.IO as T
 import qualified Data.Text.Read as T
+import qualified Data.Set.Ordered as O
 import qualified Database.PostgreSQL.Simple as DB
 import qualified Database.PostgreSQL.Simple.ToField as DB
 import qualified Database.PostgreSQL.Simple.Types as DB
@@ -74,6 +83,7 @@ data Context = Context
 	, ctxUITimerLabel :: Label
 	, ctxTimeMagnitude :: IORef TimeMagnitude
 	, ctxEventStore :: TreeStore Event
+	, ctxStateRange :: TVar StateRange
 	}
 
 initializeContext :: IO Context
@@ -90,6 +100,11 @@ initializeContext = do
 	uiTimerLabel <- labelNew (string <$> Nothing)
 	timeMagnitude <- newIORef (pDurationHint profile)
 	eventStore <- treeStoreNew []
+	stateRange <- newTVarIO StateRange
+		{ srStateCache = Uninitialized
+		, srMin = pTarget profile
+		, srMax = pTarget profile
+		}
 	pure Context
 		{ ctxConfig = config
 		, ctxProfile = profile
@@ -99,6 +114,7 @@ initializeContext = do
 		, ctxUITimerLabel = uiTimerLabel
 		, ctxTimeMagnitude = timeMagnitude
 		, ctxEventStore = eventStore
+		, ctxStateRange = stateRange
 		}
 
 data Config = Config
@@ -130,12 +146,8 @@ data Profile = Profile
 	, pDurationHint :: TimeMagnitude
 	} deriving (Eq, Ord, Read, Show)
 
-data SortOrder = Ascending | Descending | AscendingOn (Map Text Int)
+data SortOrder = Ascending | Descending | AscendingOn (OSet Text)
 	deriving (Eq, Ord, Read, Show)
-
--- | Sort numbers numerically, not lexically; e.g. this will consider "99" < "100"
-humanSort :: [Text] -> [Text]
-humanSort = sortOn (T.groupBy (\c c' -> isDigit c == isDigit c'))
 
 defaultableSection :: Text -> Text -> ValueSpec a -> Text -> SectionsSpec (Maybe a)
 defaultableSection sec atom spec help = join <$> C.optSection' sec
@@ -154,7 +166,7 @@ profileSpec = C.sectionsSpec "profile" $ pure Profile
 	where
 	textSpec = C.anyAtomSpec <!> C.textSpec
 	statesSpec = S.fromList <$> C.listSpec textSpec
-	indexMap states = AscendingOn . M.fromList $ zip states [0..]
+	indexMap = AscendingOn . O.fromList
 	orderSpec =
 		    (Ascending <$ C.atomSpec "ascending")
 		<!> (Descending <$ C.atomSpec "descending")
@@ -197,15 +209,15 @@ loadProfile profile = do
 
 sanityCheckProfile :: Profile -> IO Profile
 sanityCheckProfile Profile { pMajorStates = Just states, pSortOrder = AscendingOn tags }
-	| any (`M.notMember` tags) states = fail $ ""
+	| any (`O.notMember` tags) states = fail $ ""
 		++ "Error in profile: these major states do not appear in the sort order:"
 		++ [ c
 		   | state <- S.toAscList states
-		   , state `M.notMember` tags
+		   , state `O.notMember` tags
 		   , c <- "\n\t" ++ T.unpack state
 		   ]
 sanityCheckProfile Profile { pTarget = state, pSortOrder = AscendingOn tags }
-	| state `M.notMember` tags = fail "Error in profile: target does not appear in the sort order"
+	| state `O.notMember` tags = fail "Error in profile: target does not appear in the sort order"
 sanityCheckProfile p = pure p
 
 loadConfig :: IO Config
@@ -393,7 +405,7 @@ renderGraph ctx = do
 	-- TODO: from here on out everything is terrible
 	eForest <- liftIO (treeStoreGetForest (ctxEventStore ctx))
 	let es = postOrder eForest
-	    states = nubOrd (eState <$> es)
+	states <- liftIO (ctxStates ctx)
 	when (hay $ drop 1 es) $ do
 		let a = head es
 		    z = last es
@@ -498,6 +510,7 @@ stop :: Text
 stop = "STOP"
 
 -- TODO: catch EOF and do something sensible (probably just quit?)
+-- TODO: catch DB connection errors
 parserThread :: Context -> IO loop
 parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 	go conn = case pFPS (ctxProfile ctx) of
@@ -569,6 +582,7 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 					(printf "Ignoring unknown state %s at time %s" (show state) (show now))
 				noFrames splitKey
 
+		-- TODO: extend ctxStateRange
 		broadcast event splitKey continue won = do
 			-- tell the database
 			(runID, seqNo) <- case splitKey of
@@ -611,7 +625,7 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 
 ctxValidState :: Context -> Text -> Bool
 ctxValidState ctx s = case pSortOrder (ctxProfile ctx) of
-	AscendingOn tags -> M.member s tags
+	AscendingOn tags -> O.member s tags
 	_ -> True
 
 roundUpToPowerOf2 :: Integer -> Integer
@@ -643,6 +657,110 @@ logEvent ctx e = do
 			else do
 				treeStoreRemove store [n]
 				removeMinorEvents major (e':minor) (n-1)
+
+data HumanOrder = HumanOrder
+	{ unHumanOrder :: Text
+	, parsedHumanOrder :: [Either Natural Text]
+	}
+
+humanOrder :: Text -> HumanOrder
+humanOrder t = HumanOrder t (map parse groups) where
+	groups = T.groupBy (\c c' -> isDigit c == isDigit c') t
+	parse t = case T.decimal t of
+		Right (n, t') | T.null t' -> Left n
+		_ -> Right t
+
+instance Eq HumanOrder where h == h' = unHumanOrder h == unHumanOrder h'
+instance Ord HumanOrder where compare h h' = compare (parsedHumanOrder h) (parsedHumanOrder h')
+instance Read HumanOrder where readsPrec n s = map (first humanOrder) (readsPrec n s)
+instance Show HumanOrder where show = show . unHumanOrder
+
+class Ord a => IsText a where
+	fromText :: Text -> a
+	toText :: a -> Text
+
+instance IsText Text where
+	fromText = id
+	toText = id
+
+instance IsText HumanOrder where
+	fromText = humanOrder
+	toText = unHumanOrder
+
+instance IsText a => IsText (Down a) where
+	fromText = Down . fromText
+	toText (Down a) = toText a
+
+data StateCache where
+	Ordered :: OSet Text -> StateCache
+	Sorted :: IsText a => Set a -> StateCache
+	Uninitialized :: StateCache
+
+stateCache :: Context -> [Text] -> StateCache
+stateCache ctx ss = case pSortOrder (ctxProfile ctx) of
+	Ascending -> Sorted . S.fromList . map humanOrder $ ss
+	Descending -> Sorted . S.fromList . map (Down . humanOrder) $ ss
+	AscendingOn o -> Ordered o
+
+data StateRange = StateRange
+	{ srStateCache :: StateCache
+	, srMin :: Text
+	, srMax :: Text
+	}
+
+ctxStates :: Context -> IO [Text]
+ctxStates ctx = do
+	sr <- readTVarIO (ctxStateRange ctx)
+	case srStateCache sr of
+		Ordered ss -> case (O.findIndex (srMin sr) ss, O.findIndex (srMax sr) ss) of
+			(Just iMin, Just iMax) -> pure [fromJust (ss `O.elemAt` i) | i <- [iMin .. iMax]]
+			_ -> failedRange sr $ printf "StateRange bounds %s-%s not found in StateCache %s"
+				(show (srMin sr))
+				(show (srMax sr))
+				(show ss)
+		Sorted ss -> case (S.lookupIndex eMin ss, S.lookupIndex eMax ss) of
+			(Just iMin, Just iMax) -> pure
+				. map toText
+				. S.toAscList
+				. S.take (iMax-iMin+1)
+				. S.drop iMin
+				$ ss
+			_ -> failedRange sr $ printf "StateRange bounds %s-%s not found in StateCache %s"
+				(show (srMin sr))
+				(show (srMax sr))
+				(show (S.map toText ss))
+			where
+			eMin = fromText (srMin sr)
+			eMax = fromText (srMax sr)
+		Uninitialized -> do
+			mCache <- initializeStateCache ctx
+			cache <- case mCache of
+				Nothing -> do
+					failedRange sr "Could not contact database to initialize state cache"
+					pure (stateCache ctx [srMin sr, srMax sr])
+				Just cache -> pure cache
+			atomically $ do
+				sr' <- readTVar (ctxStateRange ctx)
+				writeTVar (ctxStateRange ctx) (sr' { srStateCache = cache })
+			ctxStates ctx
+	where
+	failedRange sr err = do
+		writeChan (ctxErrors ctx) err
+		pure $ [srMin sr | srMin sr /= srMax sr] ++ [srMax sr]
+
+initializeStateCache :: Context -> IO (Maybe StateCache)
+initializeStateCache ctx = case pSortOrder (ctxProfile ctx) of
+	AscendingOn ss -> pure (Just (Ordered ss))
+	_ -> do
+		mConn <- try (DB.connectPostgreSQL (db (ctxConfig ctx)))
+		case mConn of
+			Left err -> pure (const Nothing (DB.sqlState err {- type-checking hint -}))
+			Right conn -> do
+				ss <- DB.query conn
+					"select state from run join split on run.id = split.run where run.game = ? group by state"
+					(DB.Only (pGame (ctxProfile ctx)))
+				DB.close conn
+				pure . Just . stateCache ctx . map DB.fromOnly $ ss
 
 heartbeatThread :: Context -> IO ()
 heartbeatThread ctx = forever $ do

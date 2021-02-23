@@ -37,6 +37,7 @@ executable vertumnion
                        , ordered-containers ^>=0.2
                        , postgresql-simple ^>=0.6
                        , semigroupoids ^>=5.3
+                       , stm ^>=2.5
                        , text ^>=1.2
                        , time ^>=1.10
                        , unix ^>=2.7
