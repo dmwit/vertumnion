@@ -29,6 +29,7 @@ import Data.IORef
 import Data.List
 import Data.Map (Map)
 import Data.Maybe
+import Data.Monoid
 import Data.Ord
 import Data.Set (Set)
 import Data.Set.Ordered (OSet)
@@ -148,6 +149,22 @@ data Profile = Profile
 
 data SortOrder = Ascending | Descending | AscendingOn (OSet Text)
 	deriving (Eq, Ord, Read, Show)
+
+soCompare :: SortOrder -> Text -> Text -> Ordering
+soCompare Ascending t t' = compare t t'
+soCompare Descending t t' = compare t' t
+soCompare (AscendingOn ts) t t' = case (O.findIndex t ts, O.findIndex t' ts) of
+	(Just i, Just i') -> compare i i'
+	_ -> compare t t'
+
+soLt :: SortOrder -> Text -> Text -> Bool
+soLt so t t' = soCompare so t t' == LT
+
+soMin :: SortOrder -> Text -> Text -> Text
+soMin so t t' = if soLt so t t' then t else t'
+
+soMax :: SortOrder -> Text -> Text -> Text
+soMax so t t' = if soLt so t t' then t' else t
 
 defaultableSection :: Text -> Text -> ValueSpec a -> Text -> SectionsSpec (Maybe a)
 defaultableSection sec atom spec help = join <$> C.optSection' sec
@@ -582,7 +599,6 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 					(printf "Ignoring unknown state %s at time %s" (show state) (show now))
 				noFrames splitKey
 
-		-- TODO: extend ctxStateRange
 		broadcast event splitKey continue won = do
 			-- tell the database
 			(runID, seqNo) <- case splitKey of
@@ -597,6 +613,11 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 				(runID, seqNo, eState event, eTime event, eFrame event)
 
 			-- tell the UI
+			atomically $ do
+				sr <- readTVar (ctxStateRange ctx)
+				case srInsert (pSortOrder (ctxProfile ctx)) (eState event) sr of
+					(Any True, sr') -> writeTVar (ctxStateRange ctx) sr'
+					_ -> pure ()
 			status <- takeMVar (ctxUITimerLabelStatus ctx)
 			putMVar (ctxUITimerLabelStatus ctx) $ case status of
 				RunningSince{} -> status
@@ -707,6 +728,14 @@ data StateRange = StateRange
 	, srMin :: Text
 	, srMax :: Text
 	}
+
+srInsert :: SortOrder -> Text -> StateRange -> (Any, StateRange)
+srInsert so t sr = pure StateRange
+	<*> case srStateCache sr of
+		Sorted ts -> (Any (S.notMember t' ts), Sorted (S.insert t' ts)) where t' = fromText t
+		_ -> (Any False, srStateCache sr) -- slightly optimistic... if it's Ordered, assumes t appears in the OSet
+	<*> (Any (soLt so t (srMin sr)), soMin so t (srMin sr))
+	<*> (Any (soLt so (srMax sr) t), soMax so t (srMax sr))
 
 ctxStates :: Context -> IO [Text]
 ctxStates ctx = do
