@@ -497,16 +497,6 @@ data Command = StateChange Event | Stop UTCTime deriving (Eq, Ord, Read, Show)
 stop :: Text
 stop = "STOP"
 
-data ParserState = ParserState
-	{ psRun :: Maybe Int32
-	, psConn :: DB.Connection
-	} deriving Eq
-
-newtype Defaultable a = Defaultable (Maybe a) deriving (Eq, Ord, Read, Show)
-instance DB.ToField a => DB.ToField (Defaultable a) where
-	toField (Defaultable Nothing) = DB.toField DB.Default
-	toField (Defaultable (Just a)) = DB.toField a
-
 -- TODO: catch EOF and do something sensible (probably just quit?)
 parserThread :: Context -> IO loop
 parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
