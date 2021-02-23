@@ -430,15 +430,16 @@ updateTimerLabel ctx = postGUIAsync $ do
 		Stopped from to -> go stoppedAttrs from to
 	where
 	commonAttrs = tail [undefined
-		, AttrWeight { paWeight = WeightHeavy }
-		, AttrSize { paSize = 32 }
+		, AttrWeight { paWeight = WeightHeavy, paStart = setLater, paEnd = setLater }
+		, AttrSize { paSize = 32, paStart = setLater, paEnd = setLater }
 		]
 	runningAttrs = commonAttrs ++ tail [undefined
-		, AttrForeground { paColor = Color 0x1000 0x8000 0x0000 }
+		, AttrForeground { paColor = Color 0x1000 0x8000 0x0000, paStart = setLater, paEnd = setLater }
 		]
 	stoppedAttrs = commonAttrs ++ tail [undefined
-		, AttrForeground { paColor = Color 0xb000 0x2800 0x3800 }
+		, AttrForeground { paColor = Color 0xb000 0x2800 0x3800, paStart = setLater, paEnd = setLater }
 		]
+	setLater = error "updateTimerLabel attempted to use an attribute without setting its range first. This is a bug."
 
 	go attrs from to = do
 		mag <- readIORef (ctxTimeMagnitude ctx)
