@@ -549,6 +549,9 @@ updateTimerLabel ctx = postGUIAsync $ do
 			writeIORef (ctxTimeMagnitude ctx) mag'
 			redrawAllIntervals ctx
 
+updateGraph :: Context -> IO ()
+updateGraph = postGUIAsync . widgetQueueDraw . ctxUIGraph
+
 -- [LPS]
 showInterval :: UTCTime -> UTCTime -> TimeMagnitude -> (TimeMagnitude, String)
 showInterval old new = showNominalDiffTime (diffUTCTime new old)
@@ -720,7 +723,7 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 				RunningSince before -> Stopped before now
 				_ -> status
 			-- tell the modules
-			writeChan (ctxModuleInput ctx) Reset
+			writeChan (ctxModuleInput ctx) (Reset now)
 			-- the parser thread already knows
 
 		warnIgnoreStop = writeChan (ctxErrors ctx) "Ignoring redundant STOP"
@@ -888,7 +891,7 @@ data ModulePoint = ModulePoint
 	} deriving (Eq, Ord, Read, Show)
 
 data ModuleEvent
-	= Reset
+	= Reset UTCTime
 	| Continue Event
 	deriving (Eq, Ord, Read, Show)
 
@@ -905,21 +908,48 @@ appendOnlyModule label newPoints = Module label $ \ctx i o ->
 	let go pts = do
 	    	me <- readChan i
 	    	case me of
-	    		Reset -> go []
+	    		Reset _ -> go []
 	    		Continue e -> do
 	    			dpts <- newPoints e
 	    			let pts' = dpts ++ pts
 	    			atomically (writeTVar o pts')
-	    			postGUIAsync (widgetQueueDraw (ctxUIGraph ctx))
+	    			updateGraph ctx
 	    			go pts'
 	in go []
 
 idModule :: Module
 idModule = appendOnlyModule "run" $ \e -> pure [ModulePoint (eTime e) (State (eState e))]
 
+currentPointModule :: Module
+currentPointModule = Module "now" $ \ctx i o -> do
+	curStateVar <- newTVarIO (Nothing, Nothing)
+	forkIO . forever $ do
+		me <- readChan i
+		case me of
+			Continue e -> atomically $ writeTVar curStateVar (Just (eState e), Nothing)
+			Reset t -> atomically $ do
+				(s, _) <- readTVar curStateVar
+				writeTVar curStateVar (s, Just t)
+	forever $ do
+		curState <- atomically $ do
+			pts <- readTVar o
+			curState <- readTVar curStateVar
+			-- pause in between runs
+			when (pts == pointsFor arbitraryTime curState) retry
+			pure curState
+		now <- getCurrentTime
+		atomically $ writeTVar o (pointsFor now curState)
+		updateGraph ctx
+		threadDelay (1000000`div`30) -- update at 30fps...ish
+	where
+	pointsFor tDef (ms, mt) =
+		[ ModulePoint (fromMaybe tDef mt) (State s)
+		| Just s <- [ms]
+		]
+
 -- TODO: make this configurable
 allModules :: [Module]
-allModules = [idModule]
+allModules = [idModule, currentPointModule]
 
 moduleThread :: Context -> IO loop
 moduleThread ctx = do
