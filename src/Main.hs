@@ -2,9 +2,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE StandaloneDeriving #-}
 module Main where
 
 import Config.Schema (SectionsSpec, ValueSpec)
@@ -791,7 +789,7 @@ initializeStateCache ctx = case pSortOrder (ctxProfile ctx) of
 				DB.close conn
 				pure . Just . stateCache ctx . map DB.fromOnly $ ss
 
-heartbeatThread :: Context -> IO ()
+heartbeatThread :: Context -> IO loop
 heartbeatThread ctx = forever $ do
 	updateTimerLabel ctx
 	threadDelay (1000000`div`30) -- update at 30fps...ish
