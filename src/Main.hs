@@ -530,7 +530,7 @@ parserThread :: Context -> IO loop
 parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 	go conn = case pFPS (ctxProfile ctx) of
 		Just{} -> idling
-		Nothing -> noFrames Nothing
+		Nothing -> noFramesRunning Nothing
 		where
 		getEvent = do
 			(now, t) <- readChan (ctxInput ctx)
@@ -559,7 +559,7 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 					broadcast Event { eFrame = Just (dFrame+frame'), eTime = now, eState = state }
 						(Just splitKey)
 						(running dFrame frame')
-						(stopping idling)
+						stopping
 				| otherwise -> do
 					let ddFrame = roundUpToPowerOf2 (max frame (if signed then -1-frame' else frame))
 					    signed = frame' < 0
@@ -573,29 +573,35 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 					broadcast Event { eFrame = Just (dFrame'+frame'), eTime = now, eState = state }
 						(Just splitKey)
 						(running dFrame' frame')
-						(stopping idling)
+						stopping
 			Left (Just now) -> stopTimer now >> idling
 			Left Nothing -> running dFrame frame splitKey
 
-		stopping k = getEvent >>= \case
-			Left (Just now) -> k
-			_ -> stopping k
+		stopping = getEvent >>= \case
+			Left (Just now) -> idling
+			_ -> stopping
 
-		noFrames splitKey = do
+		noFramesRunning splitKey = do
 			(now, state) <- readChan (ctxInput ctx)
 			if state == stop
 			then do
 				if isJust splitKey then stopTimer now else warnIgnoreStop
-				noFrames Nothing
+				noFramesRunning Nothing
 			else if ctxValidState ctx state
 			then broadcast Event { eFrame = Nothing, eTime = now, eState = state }
 				splitKey
-				(noFrames . Just)
-				(stopping (noFrames Nothing))
+				(noFramesRunning . Just)
+				noFramesStopping
 			else do
 				writeChan (ctxErrors ctx)
 					(printf "Ignoring unknown state %s at time %s" (show state) (show now))
-				noFrames splitKey
+				noFramesRunning splitKey
+
+		noFramesStopping = do
+			(now, state) <- readChan (ctxInput ctx)
+			if state == stop
+			then noFramesRunning Nothing
+			else noFramesStopping
 
 		broadcast event splitKey continue won = do
 			-- tell the database
