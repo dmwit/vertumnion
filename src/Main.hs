@@ -34,6 +34,8 @@ import Data.Set.Ordered (OSet)
 import Data.Text (Text)
 import Data.Time
 import Data.Time.Calendar.OrdinalDate
+import Data.Traversable
+import Data.Void
 import Data.Word
 import Graphics.Rendering.Cairo (Render)
 import Graphics.UI.Gtk
@@ -68,7 +70,7 @@ import qualified Text.PrettyPrint.ANSI.Leijen as Doc
 main :: IO ()
 main = do
 	ctx <- initializeContext
-	traverse_ (\thread -> forkIO (thread ctx)) [loggingThread, stdinThread, parserThread, heartbeatThread]
+	traverse_ (\thread -> forkIO (thread ctx)) [loggingThread, stdinThread, parserThread, heartbeatThread, moduleThread]
 	guiThread ctx -- NB not forked
 	-- TODO: maybe stay open and start ignoring stdin, so that pipes don't fill up and block producers?
 
@@ -80,6 +82,9 @@ data Context = Context
 	-- TODO: since this is only written from parserThread (right?) it can probably be an IORef
 	, ctxUITimerLabelStatus :: MVar TimerLabelStatus
 	, ctxUITimerLabel :: Label
+	, ctxUIGraph :: DrawingArea
+	, ctxModuleInput :: Chan ModuleEvent
+	, ctxModuleOutputs :: TVar [(String, TVar [ModulePoint])]
 	, ctxTimeMagnitude :: IORef TimeMagnitude
 	, ctxEventStore :: TreeStore Event
 	, ctxStateRange :: TVar StateRange
@@ -97,6 +102,9 @@ initializeContext = do
 	initGUI
 	uiTimerLabelStatus <- newMVar BlankTimer
 	uiTimerLabel <- labelNew (string <$> Nothing)
+	uiGraph <- drawingAreaNew
+	moduleInput <- newChan
+	moduleOutputs <- newTVarIO []
 	timeMagnitude <- newIORef (pDurationHint profile)
 	eventStore <- treeStoreNew []
 	stateRange <- newTVarIO StateRange
@@ -111,6 +119,9 @@ initializeContext = do
 		, ctxInput = input
 		, ctxUITimerLabelStatus = uiTimerLabelStatus
 		, ctxUITimerLabel = uiTimerLabel
+		, ctxUIGraph = uiGraph
+		, ctxModuleInput = moduleInput
+		, ctxModuleOutputs = moduleOutputs
 		, ctxTimeMagnitude = timeMagnitude
 		, ctxEventStore = eventStore
 		, ctxStateRange = stateRange
@@ -382,13 +393,12 @@ guiThread ctx = do
 	onAdjChanged eventLogAdjustment $
 		adjustmentGetUpper eventLogAdjustment >>= adjustmentSetValue eventLogAdjustment
 
-	graph <- drawingAreaNew
-	widgetSetSizeRequest graph 200 200
-	on graph draw (renderGraph ctx)
+	widgetSetSizeRequest (ctxUIGraph ctx) 200 200
+	on (ctxUIGraph ctx) draw (renderGraph ctx)
 
 	dataPane <- vPanedNew
 	panedPack1 dataPane eventLogScroll True True
-	panedPack2 dataPane graph False True
+	panedPack2 dataPane (ctxUIGraph ctx) False True
 
 	boxPackStart vbox gameLabel PackNatural 0
 	boxPackStart vbox targetLabel PackNatural 0
@@ -417,34 +427,96 @@ renderGraph ctx = do
 	if w < h
 		then Cairo.translate 0 ((h-w)/2) >> Cairo.scale w w
 		else Cairo.translate ((w-h)/2) 0 >> Cairo.scale h h
-	states <- liftIO (ctxStates ctx)
-	-- TODO: from here on out everything is terrible
-	eForest <- liftIO (treeStoreGetForest (ctxEventStore ctx))
-	let es = postOrder eForest
-	when (hay $ drop 1 es) $ do
-		let a = head es
-		    z = last es
-		Cairo.setLineWidth 0.01
-		Cairo.scale (1/realToFrac (diffUTCTime (eTime z) (eTime a))) (1/fromIntegral (length states))
-		for_ es $ \e -> do
-			Cairo.arc
-				(realToFrac (diffUTCTime (eTime e) (eTime a)))
-				((fromIntegral . fromJust . findIndex (eState e ==)) states)
-				0.01
-				0
-				(2*pi)
-			Cairo.stroke
+	states_ <- liftIO (ctxStates ctx)
+	ptss_ <- liftIO $ readTVarIO (ctxModuleOutputs ctx)
+	ptss <- liftIO $ for ptss_ $ \(label, ptVar) -> (,) label <$> readTVarIO ptVar
 
-treeStoreGetForest :: TreeStore a -> IO (Forest a)
-treeStoreGetForest s = do
-	n <- treeModelIterNChildren s Nothing
-	traverse (treeStoreGetTree s . pure) [0..n-1]
+	let
+		states :: Map Text Double
+		states = M.fromList (zip states_ [0..])
 
-postOrder :: Forest a -> [a]
-postOrder = concatMap postOrderTree where postOrderTree (Node a as) = postOrder as ++ [a]
+		maxStateIx :: Double
+		maxStateIx = fromIntegral (M.size states - 1)
 
-hay :: [a] -> Bool
-hay = not . null
+		tbX = chooseTimeBounds [x pt | (_, pts) <- ptss, pt <- pts]
+		tbY = chooseTimeBounds [t | (_, pts) <- ptss, ModulePoint { y = Time t } <- pts]
+
+		isMajor = case pMajorStates (ctxProfile ctx) of
+			Nothing -> const True
+			Just ss -> (`S.member` ss)
+
+		xPos :: UTCTime -> Double
+		xPos = timePos tbX
+
+		xDiffPos :: NominalDiffTime -> Double
+		xDiffPos = diffTimePos tbX
+
+		yPos :: Dependent -> Double
+		yPos (State s) = 1 - (states M.! s) / maxStateIx
+		yPos (Time t) = 1 - timePos tbY t
+
+	Cairo.setLineWidth 0.001
+	flip M.traverseWithKey states $ \state ix -> when (isMajor state) $ do
+		Cairo.moveTo 0 (ix / maxStateIx)
+		Cairo.lineTo 1 (ix / maxStateIx)
+	for_ [0, tbGridLine tbX .. tbMax tbX] $ \d -> do
+		Cairo.moveTo (xDiffPos d) 0
+		Cairo.lineTo (xDiffPos d) 1
+	Cairo.stroke
+
+	Cairo.setLineWidth 0.01
+	for_ ptss $ \(lbl, pts) -> for_ pts $ \pt -> do
+		Cairo.arc (xPos (x pt)) (yPos (y pt)) 0.01 0 (2*pi)
+		Cairo.stroke
+
+data TimeBounds = TimeBounds
+	{ tbZero :: UTCTime
+	, tbGridLine :: NominalDiffTime
+	, tbMax :: NominalDiffTime
+	} deriving (Eq, Ord, Read, Show)
+
+-- [LPS]
+chooseTimeBounds :: [UTCTime] -> TimeBounds
+chooseTimeBounds [] = TimeBounds
+	{ tbZero = arbitraryTime
+	, tbGridLine = 1
+	, tbMax = 10
+	}
+chooseTimeBounds ts = TimeBounds
+	{ tbZero = zero
+	, tbGridLine = grid
+	, tbMax = bigAndRound
+	} where
+	zero = minimum ts
+	big = maximum ts
+	bigDiff = diffUTCTime big zero
+	gridTarget = bigDiff / 10
+	grid = case S.lookupGE gridTarget roundIntervals of
+		Just v -> v
+		Nothing -> gridDays (60*60*24) (gridTarget / (60*60*24))
+	gridDays cur tgt
+		| tgt > 5 = gridDays (cur*10) (tgt/10)
+		| tgt > 2 = cur*5
+		| tgt > 1 = cur*2
+		| otherwise = cur
+	bigAndRound = fromInteger (ceiling (bigDiff / grid)) * grid
+
+roundIntervals :: Set NominalDiffTime
+roundIntervals = S.fromList
+	[      1,       2,       5,       10,       30 -- seconds
+	,   60*1,    60*2,    60*5,    60*10,    60*30 -- minutes
+	,60*60*1, 60*60*2, 60*60*6, 60*60*12           -- hours
+	]
+
+-- [LPS]
+timePos :: TimeBounds -> UTCTime -> Double
+timePos tb t = diffTimePos tb (diffUTCTime t (tbZero tb))
+
+-- [LPS]
+diffTimePos :: TimeBounds -> NominalDiffTime -> Double
+diffTimePos tb d = if tbMax tb == 0
+	then 0.5
+	else realToFrac (d / tbMax tb)
 
 data TimeMagnitude = Seconds | Minutes | Hours | Days Word8 deriving (Eq, Ord, Read, Show)
 
@@ -477,7 +549,7 @@ updateTimerLabel ctx = postGUIAsync $ do
 			writeIORef (ctxTimeMagnitude ctx) mag'
 			redrawAllIntervals ctx
 
--- TODO: leap seconds lmao
+-- [LPS]
 showInterval :: UTCTime -> UTCTime -> TimeMagnitude -> (TimeMagnitude, String)
 showInterval old new = showNominalDiffTime (diffUTCTime new old)
 
@@ -632,6 +704,9 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 					_ -> treeStoreClear (ctxEventStore ctx)
 				logEvent ctx event
 
+			-- tell the modules
+			writeChan (ctxModuleInput ctx) (Continue event)
+
 			-- tell the parser thread
 			if eState event == pTarget (ctxProfile ctx)
 			then stopTimer (eTime event) >> won
@@ -644,6 +719,8 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 			putMVar (ctxUITimerLabelStatus ctx) $ case status of
 				RunningSince before -> Stopped before now
 				_ -> status
+			-- tell the modules
+			writeChan (ctxModuleInput ctx) Reset
 			-- the parser thread already knows
 
 		warnIgnoreStop = writeChan (ctxErrors ctx) "Ignoring redundant STOP"
@@ -799,3 +876,61 @@ heartbeatThread :: Context -> IO loop
 heartbeatThread ctx = forever $ do
 	updateTimerLabel ctx
 	threadDelay (1000000`div`30) -- update at 30fps...ish
+
+data Dependent
+	= State Text
+	| Time UTCTime
+	deriving (Eq, Ord, Read, Show)
+
+data ModulePoint = ModulePoint
+	{ x :: UTCTime
+	, y :: Dependent
+	} deriving (Eq, Ord, Read, Show)
+
+data ModuleEvent
+	= Reset
+	| Continue Event
+	deriving (Eq, Ord, Read, Show)
+
+data Module = Module
+	{ mLabel :: String
+	, mLaunch :: Context -> Chan ModuleEvent -> TVar [ModulePoint] -> IO Void
+	}
+
+-- | If your module only ever adds points, and only needs to see the latest
+-- event to know which points it wants to add, you can use this wrapper to do
+-- some of the bookkeeping for you.
+appendOnlyModule :: String -> (Event -> IO [ModulePoint]) -> Module
+appendOnlyModule label newPoints = Module label $ \ctx i o ->
+	let go pts = do
+	    	me <- readChan i
+	    	case me of
+	    		Reset -> go []
+	    		Continue e -> do
+	    			dpts <- newPoints e
+	    			let pts' = dpts ++ pts
+	    			atomically (writeTVar o pts')
+	    			postGUIAsync (widgetQueueDraw (ctxUIGraph ctx))
+	    			go pts'
+	in go []
+
+idModule :: Module
+idModule = appendOnlyModule "run" $ \e -> pure [ModulePoint (eTime e) (State (eState e))]
+
+-- TODO: make this configurable
+allModules :: [Module]
+allModules = [idModule]
+
+moduleThread :: Context -> IO loop
+moduleThread ctx = do
+	(chans, outs) <- fmap unzip . for allModules $ \m -> do
+		chan <- newChan
+		tvar <- newTVarIO []
+		forkIO (() <$ mLaunch m ctx chan tvar)
+		pure (chan, (mLabel m, tvar))
+	atomically $ writeTVar (ctxModuleOutputs ctx) outs
+	forever $ do
+		mEvent <- readChan (ctxModuleInput ctx)
+		for_ chans $ \chan -> writeChan chan mEvent
+
+-- TODO: lmao leap seconds. grep for [LPS]
