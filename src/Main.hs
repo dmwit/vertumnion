@@ -1001,9 +1001,7 @@ currentPointModule = Module "now" $ \ctx i o -> do
 		me <- readChan i
 		case me of
 			Continue e -> atomically $ writeTVar curStateVar (Just (eState e), Nothing)
-			Reset t -> atomically $ do
-				(s, _) <- readTVar curStateVar
-				writeTVar curStateVar (s, Just t)
+			Reset t -> atomically $ writeTVar curStateVar (Nothing, Just t)
 	forever $ do
 		curState <- atomically $ do
 			pts <- readTVar o
@@ -1017,9 +1015,10 @@ currentPointModule = Module "now" $ \ctx i o -> do
 		threadDelay (1000000`div`30) -- update at 30fps...ish
 	where
 	pointsFor tDef (ms, mt) =
-		[ ModulePoint (fromMaybe tDef mt) (State s)
+		[ ModulePoint t dep
 		| Just s <- [ms]
-		]
+		, dep <- [State s, Time t]
+		] where t = fromMaybe tDef mt
 
 -- TODO: make this configurable
 allModules :: [Module]
