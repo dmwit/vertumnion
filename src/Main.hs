@@ -3,6 +3,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeApplications #-}
 module Main where
 
 import Config.Schema (SectionsSpec, ValueSpec)
@@ -155,6 +156,8 @@ data Profile = Profile
 	, pSortOrder :: SortOrder
 	, pDurationHint :: TimeMagnitude
 	} deriving (Eq, Ord, Read, Show)
+
+type ID = Int32
 
 data SortOrder = Ascending | Descending | AscendingOn (OSet Text)
 	deriving (Eq, Ord, Read, Show)
@@ -439,7 +442,7 @@ renderGraph ctx = do
 		maxStateIx = fromIntegral (M.size states - 1)
 
 		tbX = chooseTimeBounds [x pt | (_, pts) <- ptss, pt <- pts]
-		tbY = chooseTimeBounds [t | (_, pts) <- ptss, ModulePoint { y = Time t } <- pts]
+		tbY = chooseTimeBounds $ tbZero tbX : [t | (_, pts) <- ptss, ModulePoint { y = Time t } <- pts]
 
 		isMajor = case pMajorStates (ctxProfile ctx) of
 			Nothing -> const True
@@ -456,9 +459,11 @@ renderGraph ctx = do
 		yPos (Time t) = 1 - timePos tbY t
 
 	Cairo.setLineWidth 0.001
+	-- TODO: only draw state lines when there are state points
+	-- TODO: draw time lines when there are time points
 	flip M.traverseWithKey states $ \state ix -> when (isMajor state) $ do
-		Cairo.moveTo 0 (ix / maxStateIx)
-		Cairo.lineTo 1 (ix / maxStateIx)
+		Cairo.moveTo 0 (1 - ix / maxStateIx)
+		Cairo.lineTo 1 (1 - ix / maxStateIx)
 	for_ [0, tbGridLine tbX .. tbMax tbX] $ \d -> do
 		Cairo.moveTo (xDiffPos d) 0
 		Cairo.lineTo (xDiffPos d) 1
@@ -686,7 +691,7 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 					[DB.Only runID] <- DB.query conn
 						"insert into run (game, fps) values (?, ?) returning id"
 						(pGame (ctxProfile ctx), pFPS (ctxProfile ctx))
-					pure (runID :: Int32, 0 :: Int32)
+					pure (runID :: ID, 0 :: ID)
 			DB.execute conn
 				"insert into split (run, seq_no, state, moment, frame) values (?, ?, ?, ?, ?)"
 				(runID, seqNo, eState event, eTime event, eFrame event)
@@ -903,22 +908,91 @@ data Module = Module
 -- | If your module only ever adds points, and only needs to see the latest
 -- event to know which points it wants to add, you can use this wrapper to do
 -- some of the bookkeeping for you.
-appendOnlyModule :: String -> (Event -> IO [ModulePoint]) -> Module
-appendOnlyModule label newPoints = Module label $ \ctx i o ->
+appendOnlyModule :: String -> (Context -> IO a) -> (a -> ModuleEvent -> IO [ModulePoint]) -> Module
+appendOnlyModule label initialize newPoints = Module label $ \ctx i o -> do
+	a <- initialize ctx
 	let go pts = do
 	    	me <- readChan i
-	    	case me of
-	    		Reset _ -> go []
-	    		Continue e -> do
-	    			dpts <- newPoints e
-	    			let pts' = dpts ++ pts
-	    			atomically (writeTVar o pts')
-	    			updateGraph ctx
-	    			go pts'
-	in go []
+	    	dpts <- newPoints a me
+	    	let pts' = dpts ++ pts
+	    	when (not (null dpts)) $ do
+	    		atomically (writeTVar o pts')
+	    		updateGraph ctx
+	    	go $ case me of
+	    		Reset{} -> []
+	    		Continue{} -> pts'
+	go []
+
+-- | If you meet the requirements of 'appendOnlyModule', and additionally your
+-- new points always occur at the same time as the most recent event, you can
+-- use this to add the x-coordinate for you.
+synchronousOnlyModule :: String -> (Context -> IO a) -> (a -> ModuleEvent -> IO [Dependent]) -> Module
+synchronousOnlyModule label initialize newDependents
+	= appendOnlyModule label initialize $ \a me ->
+		map (ModulePoint (meTime me)) <$> newDependents a me
+	where
+	meTime (Continue e) = eTime e
+	meTime (Reset t) = t
 
 idModule :: Module
-idModule = appendOnlyModule "run" $ \e -> pure [ModulePoint (eTime e) (State (eState e))]
+idModule = synchronousOnlyModule "run" def $ \ ~() me -> pure [State (eState e) | Continue e <- [me]]
+
+pbModule :: Module
+pbModule = synchronousOnlyModule "PB" initialize addPBRun
+	where
+	initialize ctx = do
+		pbRef <- newIORef Nothing
+		eConn <- try (DB.connectPostgreSQL (db (ctxConfig ctx)))
+		case eConn of
+			Left err -> writeChan (ctxErrors ctx) $ printf
+				"Error connecting to database in pbModule: %s"
+				(displayException @DB.SqlError err)
+			Right conn -> pure ()
+		pure (pbRef, eConn, pGame (ctxProfile ctx), pTarget (ctxProfile ctx))
+
+	addPBRun (_, Left err, _, _) _ = pure []
+	addPBRun (pbRef, _, _, _) Reset{} = [] <$ writeIORef pbRef Nothing
+	addPBRun a@(pbRef, Right conn, game, tgt) me@(Continue e) = do
+		mPB <- readIORef pbRef
+		case mPB of
+			Just pb -> pure $ case M.lookup (eState e) pb of
+				Nothing -> []
+				-- [LPS]
+				Just t -> [Time (addUTCTime (diffUTCTime (pb M.! tgt) t) (eTime e))]
+			Nothing -> do
+				runs <- DB.query @_ @(ID, CalendarDiffTime) conn findPBRunQuery (eState e, tgt, game)
+				pb <- case runs of
+					[] -> pure M.empty
+					(runID, _):_ -> M.fromList <$> DB.query conn
+						"select state, min(moment) from split where run = '?' group by state"
+						(DB.Only runID)
+				writeIORef pbRef (Just pb)
+				addPBRun a me
+
+	findPBRunQuery = "\
+		\select min(b_run), e_moment - b_moment as duration \
+		\from \
+			\(\
+				\(\
+					\select run as b_run, moment as b_moment, seq_no as b_seq_no \
+					\from split \
+					\where state = ? \
+				\) as beginning \
+				\join \
+				\( \
+					\select run as e_run, moment as e_moment, seq_no as e_seq_no \
+					\from split \
+					\where state = ? \
+				\) as ending \
+				\on b_run = e_run and b_seq_no < e_seq_no \
+			\) as interval \
+			\join \
+			\run \
+			\on interval.b_run = run.id \
+		\where run.game = ? \
+		\group by duration \
+		\order by duration \
+		\limit 1"
 
 currentPointModule :: Module
 currentPointModule = Module "now" $ \ctx i o -> do
@@ -949,7 +1023,7 @@ currentPointModule = Module "now" $ \ctx i o -> do
 
 -- TODO: make this configurable
 allModules :: [Module]
-allModules = [idModule, currentPointModule]
+allModules = [idModule, pbModule, currentPointModule]
 
 moduleThread :: Context -> IO loop
 moduleThread ctx = do
