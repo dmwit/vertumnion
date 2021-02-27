@@ -441,22 +441,23 @@ renderGraph ctx = do
 		maxStateIx :: Double
 		maxStateIx = fromIntegral (M.size states - 1)
 
-		tbX = chooseTimeBounds [x pt | (_, pts) <- ptss, pt <- pts]
-		tbY = chooseTimeBounds $ tbZero tbX : [t | (_, pts) <- ptss, ModulePoint { y = Time t } <- pts]
+		tb = chooseTimeBounds
+			$  [x pt | (_, pts) <- ptss, pt <- pts]
+			++ [t | (_, pts) <- ptss, ModulePoint { y = Time t } <- pts]
 
 		isMajor = case pMajorStates (ctxProfile ctx) of
 			Nothing -> const True
 			Just ss -> (`S.member` ss)
 
 		xPos :: UTCTime -> Double
-		xPos = timePos tbX
+		xPos = timePos tb
 
 		xDiffPos :: NominalDiffTime -> Double
-		xDiffPos = diffTimePos tbX
+		xDiffPos = diffTimePos tb
 
 		yPos :: Dependent -> Double
 		yPos (State s) = 1 - (states M.! s) / maxStateIx
-		yPos (Time t) = 1 - timePos tbY t
+		yPos (Time t) = 1 - timePos tb t
 
 	Cairo.setLineWidth 0.001
 	-- TODO: only draw state lines when there are state points
@@ -464,7 +465,7 @@ renderGraph ctx = do
 	flip M.traverseWithKey states $ \state ix -> when (isMajor state) $ do
 		Cairo.moveTo 0 (1 - ix / maxStateIx)
 		Cairo.lineTo 1 (1 - ix / maxStateIx)
-	for_ [0, tbGridLine tbX .. tbMax tbX] $ \d -> do
+	for_ [0, tbGridLine tb .. tbMax tb] $ \d -> do
 		Cairo.moveTo (xDiffPos d) 0
 		Cairo.lineTo (xDiffPos d) 1
 	Cairo.stroke
