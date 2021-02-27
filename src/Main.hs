@@ -459,6 +459,9 @@ renderGraph ctx = do
 		yPos (State s) = 1 - (states M.! s) / maxStateIx
 		yPos (Time t) = 1 - timePos tb t
 
+		numModules :: Double
+		numModules = fromIntegral (length ptss)
+
 	Cairo.setLineWidth 0.001
 	-- TODO: only draw state lines when there are state points
 	-- TODO: draw time lines when there are time points
@@ -471,9 +474,17 @@ renderGraph ctx = do
 	Cairo.stroke
 
 	Cairo.setLineWidth 0.01
-	for_ ptss $ \(lbl, pts) -> for_ pts $ \pt -> do
-		Cairo.arc (xPos (x pt)) (yPos (y pt)) 0.01 0 (2*pi)
-		Cairo.stroke
+	Cairo.setLineCap Cairo.LineCapRound
+	for_ (zip [0..] ptss) $ \(i, (lbl, pts)) -> do
+		let angle = pi * i / numModules
+		    dx = 0.01 * cos angle
+		    dy = 0.01 * sin angle
+		for_ pts $ \pt -> do
+			let xCoord = xPos (x pt)
+			    yCoord = yPos (y pt)
+			Cairo.moveTo (xCoord + dx) (yCoord + dy)
+			Cairo.lineTo (xCoord - dx) (yCoord - dy)
+	Cairo.stroke
 
 data TimeBounds = TimeBounds
 	{ tbZero :: UTCTime
