@@ -536,6 +536,7 @@ updateTimerLabel ctx = postGUIAsync $ do
 	commonAttrs = tail [undefined
 		, AttrWeight { paWeight = WeightHeavy, paStart = setLater, paEnd = setLater }
 		, AttrSize { paSize = 32, paStart = setLater, paEnd = setLater }
+		, AttrFamily { paFamily = "FreeMono,Latin Modern Mono,Noto Sans Mono CJK JP,DejaVu Sans Mono", paStart = setLater, paEnd = setLater }
 		]
 	runningAttrs = commonAttrs ++ tail [undefined
 		, AttrForeground { paColor = Color 0x1000 0x8000 0x0000, paStart = setLater, paEnd = setLater }
