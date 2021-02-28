@@ -18,6 +18,9 @@ import Data.Bifunctor
 import Data.Bits
 import Data.ByteString (ByteString)
 import Data.Char
+import Data.Colour.CIE
+import Data.Colour.CIE.Illuminant
+import Data.Colour.SRGB
 import Data.Containers.ListUtils
 import Data.Default
 import Data.Foldable
@@ -473,18 +476,17 @@ renderGraph ctx = do
 		Cairo.lineTo (xDiffPos d) 1
 	Cairo.stroke
 
-	Cairo.setLineWidth 0.01
-	Cairo.setLineCap Cairo.LineCapRound
 	for_ (zip [0..] ptss) $ \(i, (lbl, pts)) -> do
-		let angle = pi * i / numModules
-		    dx = 0.01 * cos angle
-		    dy = 0.01 * sin angle
+		let dAngle = min (pi / numModules) (pi / 12)
+		    angle = 2 * pi * i / numModules
+		    RGB r g b = toSRGB (cieLAB d65 50 (100 * cos angle) (100 * sin angle))
+		Cairo.setSourceRGB r g b
 		for_ pts $ \pt -> do
 			let xCoord = xPos (x pt)
 			    yCoord = yPos (y pt)
-			Cairo.moveTo (xCoord + dx) (yCoord + dy)
-			Cairo.lineTo (xCoord - dx) (yCoord - dy)
-	Cairo.stroke
+			Cairo.moveTo xCoord yCoord
+			Cairo.arc xCoord yCoord 0.03 (angle-dAngle) (angle+dAngle)
+		Cairo.fill
 
 data TimeBounds = TimeBounds
 	{ tbZero :: UTCTime
