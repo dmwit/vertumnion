@@ -455,8 +455,8 @@ renderGraph ctx = do
 		xPos :: UTCTime -> Double
 		xPos = timePos tb
 
-		xDiffPos :: NominalDiffTime -> Double
-		xDiffPos = diffTimePos tb
+		coordDiffPos :: NominalDiffTime -> Double
+		coordDiffPos = diffTimePos tb
 
 		yPos :: Dependent -> Double
 		yPos (State s) = 1 - (states M.! s) / maxStateIx
@@ -465,16 +465,25 @@ renderGraph ctx = do
 		numModules :: Double
 		numModules = fromIntegral (length ptss)
 
-	Cairo.setLineWidth 0.001
-	-- TODO: only draw state lines when there are state points
-	-- TODO: draw time lines when there are time points
-	flip M.traverseWithKey states $ \state ix -> when (isMajor state) $ do
-		Cairo.moveTo 0 (1 - ix / maxStateIx)
-		Cairo.lineTo 1 (1 - ix / maxStateIx)
-	for_ [0, tbGridLine tb .. tbMax tb] $ \d -> do
-		Cairo.moveTo (xDiffPos d) 0
-		Cairo.lineTo (xDiffPos d) 1
-	Cairo.stroke
+		hasTime = not . null . concatMap snd $ ptss
+		hasState = not . null $ [() | (_, pts) <- ptss, ModulePoint { y = State{} } <- pts]
+
+	when hasTime $ do
+		Cairo.setLineWidth 0.001
+		for_ [0, tbGridLine tb .. tbMax tb] $ \d -> do
+			let coord = coordDiffPos d
+			Cairo.moveTo coord 0
+			Cairo.lineTo coord 1
+			Cairo.moveTo 0 coord
+			Cairo.lineTo 1 coord
+		Cairo.stroke
+	when hasState $ do
+		Cairo.setLineWidth 0.002
+		Cairo.setDash [0.05, 0.05] 0.025
+		flip M.traverseWithKey states $ \state ix -> when (isMajor state) $ do
+			Cairo.moveTo 0 (1 - ix / maxStateIx)
+			Cairo.lineTo 1 (1 - ix / maxStateIx)
+		Cairo.stroke
 
 	for_ (zip [0..] ptss) $ \(i, (lbl, pts)) -> do
 		let dAngle = min (pi / numModules) (pi / 12)
