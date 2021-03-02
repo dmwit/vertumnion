@@ -163,6 +163,9 @@ data Profile = Profile
 
 type ID = Int32
 
+-- TODO: add a function to extract a Maybe (OSet Text), then triage current
+-- uses of SortOrder/pSortOrder for ways to use it; reasons: DRY, get compiler
+-- warnings if we someday add DescendingOn or something
 data SortOrder = Ascending | Descending | AscendingOn (OSet Text)
 	deriving (Eq, Ord, Read, Show)
 
