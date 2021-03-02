@@ -41,6 +41,7 @@ import Data.Time.Calendar.OrdinalDate
 import Data.Traversable
 import Data.Void
 import Data.Word
+import Database.PostgreSQL.Simple (Connection)
 import Graphics.Rendering.Cairo (Render)
 import Graphics.UI.Gtk
 import Numeric.Natural
@@ -1043,6 +1044,32 @@ currentPointModule = Module "now" $ \ctx i o -> do
 		| Just s <- [ms]
 		, dep <- [State s, Time t]
 		] where t = fromMaybe tDef mt
+
+finishableStates :: Context -> Connection -> IO (Set Text)
+finishableStates ctx conn
+	= restrict . S.fromList . map DB.fromOnly <$> DB.query conn
+		"with recursive finishable(state) as (\
+			\values (?) \
+			\union \
+			\select f.state \
+			\from split as t \
+			\join finishable on t.state = finishable.state \
+			\join run on run = id and game = ? \
+			\join split as f on f.run = t.run and f.seq_no+1 = t.seq_no\
+		\) select state from finishable"
+		(pTarget p, pGame p)
+	where
+	p = ctxProfile ctx
+	restrict ss = case pSortOrder p of
+		-- paranoia: what if there are two profiles with the same game name?
+		-- (but not quite paranoid enough to deal with two profiles
+		-- with the same game name and shared states. at some point
+		-- you finally have to give in to GIGO)
+		AscendingOn ss' -> S.intersection (O.toSet ss') ss
+		-- explicit matches so the compiler can warn us later if
+		-- DescendingOn becomes a thing or something like that
+		Ascending -> ss
+		Descending -> ss
 
 -- TODO: make this configurable
 allModules :: [Module]
