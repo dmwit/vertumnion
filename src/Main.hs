@@ -1080,6 +1080,38 @@ finishableStates ctx conn
 		Ascending -> ss
 		Descending -> ss
 
+-- This produces the expected (in the statistics sense of the term) run time
+-- from all source states that can reach the target to the target. The model
+-- used here is that if you are currently in state S0, then the next state you
+-- arrive at S1 and the time it takes to get there t are sampled IID from some
+-- (unknown) distribution.
+--
+-- Suppose for a moment that we *did* know that distribution for each state. Then
+--
+-- E[T → T] = 0
+--
+-- E⎡S  → T⎤ = ∑ p  * ⎛t   + E[S  → T]⎞  	whenever S  ≠ T
+--  ⎣ i    ⎦   j  ij  ⎝ ij      j     ⎠  	          i
+--
+-- where T is the target state, S  ranges over states that can reach T (as does
+--                               i
+--
+-- S ⎞, p   is the probability of transitioning to state S  given that you are
+--  j⎠   ij                                               j
+--
+-- in state S  right now, and t   is the expected duration of a transition from
+--           i                 ij
+--
+-- S  to S .
+--  i     j
+--
+-- Now in the case where we do *not* know the distribution for each state, we
+-- can approximate it by the uniform distribution over transition/duration
+-- pairs from previous runs. This gives us estimates of p   and t   and a
+--                                                       ij      ij
+-- collection of linear equations with E⎡S  → T⎤ as the variables. We can
+--                                      ⎣ i    ⎦
+-- estimate these expectations by solving the system of linear equations.
 expectedRunTimes :: Context -> Connection -> IO (Map Text NominalDiffTime)
 expectedRunTimes ctx conn = do
 	ss <- finishableStates ctx conn
