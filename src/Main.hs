@@ -963,8 +963,13 @@ synchronousOnlyModule label initialize newDependents
 	meTime (Continue e) = eTime e
 	meTime (Reset t) = t
 
-idModule :: Module
-idModule = synchronousOnlyModule "run" def $ \ ~() me -> pure [State (eState e) | Continue e <- [me]]
+eventProgressModule :: Module
+eventProgressModule = synchronousOnlyModule "event progress" def
+	$ \ ~() me -> pure [State (eState e) | Continue e <- [me]]
+
+timeProgressModule :: Module
+timeProgressModule = synchronousOnlyModule "time progress" def
+	$ \ ~() me -> pure [Time (eTime e) | Continue e <- [me]]
 
 pbModule :: Module
 pbModule = synchronousOnlyModule "PB" initialize addPBRun
@@ -1147,7 +1152,7 @@ expectedModule = synchronousOnlyModule "expected" initialize handleEvent where
 
 -- TODO: make this configurable
 allModules :: [Module]
-allModules = [idModule, expectedModule, pbModule, currentPointModule]
+allModules = [eventProgressModule, timeProgressModule, expectedModule, pbModule, currentPointModule]
 
 moduleThread :: Context -> IO loop
 moduleThread ctx = do
