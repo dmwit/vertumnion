@@ -352,7 +352,7 @@ guiThread ctx = do
 	window <- windowNew
 	on window objectDestroy mainQuit
 	vbox <- vBoxNew False 0
-	set window [windowTitle := string "wow", containerChild := vbox]
+	set window [windowTitle := string "vertumnion", containerChild := vbox]
 
 	gameLabel <- labelNew . Just . pGame . ctxProfile $ ctx
 	-- TODO: Maybe it would be nice for the target to be editable
