@@ -1172,3 +1172,7 @@ moduleThread ctx = do
 		for_ chans $ \chan -> writeChan chan mEvent
 
 -- TODO: lmao leap seconds. grep for [LPS]
+-- Marc suggests using the monotonic clock provided by the CPU. This would
+-- neatly deal with the leap second issue, and would also not have the problems
+-- that the current solution has with NTP and the like. Check out the clock
+-- package; MonotonicCoarse is probably good enough for my needs.
