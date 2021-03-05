@@ -1083,7 +1083,8 @@ finishableStates ctx conn
 expectedRunTimes :: Context -> Connection -> IO (Map Text NominalDiffTime)
 expectedRunTimes ctx conn = do
 	ss <- finishableStates ctx conn
-	let nonTargets = S.delete (pTarget (ctxProfile ctx)) ss
+	let target = pTarget (ctxProfile ctx)
+	    nonTargets = S.delete target ss
 	stats_ <- DB.query conn
 		"select f.state, t.state, count(*), sum(t.moment - f.moment) \
 		\from split as f \
@@ -1127,7 +1128,11 @@ expectedRunTimes ctx conn = do
 		"Some finishable states didn't have any edges to other finishable states or something? Weird. (nonTargets, maps) = %s"
 		(show (nonTargets, maps))
 	let expectedTimes = (Matrix.ident (S.size nonTargets) - transitionMatrix) Matrix.<\> edgeTimes
-	pure . M.fromList . zipWith (\s t -> (s, realToFrac t)) nonTargetsList $ Matrix.toList expectedTimes
+	pure
+		. M.insert target 0
+		. M.fromList
+		. zipWith (\s t -> (s, realToFrac t)) nonTargetsList
+		$ Matrix.toList expectedTimes
 
 expectedModule :: Module
 expectedModule = synchronousOnlyModule "expected" initialize handleEvent where
