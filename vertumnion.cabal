@@ -34,6 +34,7 @@ executable vertumnion
                        , filepath ^>=1.4
                        , glib ^>=0.13
                        , gtk3 ^>=0.15
+                       , hmatrix ^>=0.20
                        , optparse-applicative ^>=0.15
                        , ordered-containers ^>=0.2
                        , postgresql-simple ^>=0.6

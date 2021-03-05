@@ -70,6 +70,7 @@ import qualified Database.PostgreSQL.Simple as DB
 import qualified Database.PostgreSQL.Simple.ToField as DB
 import qualified Database.PostgreSQL.Simple.Types as DB
 import qualified Graphics.Rendering.Cairo as Cairo
+import qualified Numeric.LinearAlgebra as Matrix
 import qualified Text.PrettyPrint.ANSI.Leijen as Doc
 
 main :: IO ()
@@ -1074,9 +1075,79 @@ finishableStates ctx conn
 		Ascending -> ss
 		Descending -> ss
 
+expectedRunTimes :: Context -> Connection -> IO (Map Text NominalDiffTime)
+expectedRunTimes ctx conn = do
+	ss <- finishableStates ctx conn
+	let nonTargets = S.delete (pTarget (ctxProfile ctx)) ss
+	stats_ <- DB.query conn
+		"select f.state, t.state, count(*), sum(t.moment - f.moment) \
+		\from split as f \
+		\join split as t \
+		\on f.run = t.run and f.seq_no+1 = t.seq_no and f.state in ? and t.state in ? \
+		\join run \
+		\on f.run = id and game = ? \
+		\group by f.state, t.state"
+		(DB.In . S.toList $ nonTargets, DB.In . S.toList $ ss, pGame (ctxProfile ctx))
+	maps <- for stats_ $ \row@(from, to, n, CalendarDiffTime months dur) -> do
+		when (months /= 0) . writeChan (ctxErrors ctx) $ printf
+			"Saw non-zero amount of months in expectedRunTimes; offending row: %s"
+			(show row)
+		pure
+			. M.singleton from
+			. M.singleton to
+			$ ( (fromIntegral :: Int64 -> Double) n
+			  , (realToFrac :: NominalDiffTime -> Double) dur
+			  )
+	let stats = M.unionsWith (M.unionWith pointwiseAddition) maps
+	    pointwiseAddition (n, dur) (n', dur') = (n+n', dur+dur')
+	    outEdgeCounts = sum . fmap fst <$> stats
+	    nonTargetsList = S.toList nonTargets
+	    transitionMatrix = Matrix.matrix (S.size nonTargets)
+	    	[ M.findWithDefault 0 to outEdges / outEdgeCount
+	    	| from <- nonTargetsList
+	    	, let outEdges = fst <$> M.findWithDefault M.empty from stats
+	    	      outEdgeCount = max 1 (M.findWithDefault 1 from outEdgeCounts)
+	    	, to <- nonTargetsList
+	    	]
+	    edgeTimes = Matrix.vector
+	    	[ sum
+	    		[ M.findWithDefault 0 to outEdges / outEdgeCount
+	    		| to <- S.toList ss
+	    		]
+	    	| from <- nonTargetsList
+	    	, let outEdges = snd <$> M.findWithDefault M.empty from stats
+	    	      outEdgeCount = max 1 (M.findWithDefault 1 from outEdgeCounts)
+	    	]
+	when (M.keysSet stats /= nonTargets) . writeChan (ctxErrors ctx) $ printf
+		"Some finishable states didn't have any edges to other finishable states or something? Weird. (nonTargets, maps) = %s"
+		(show (nonTargets, maps))
+	let expectedTimes = (Matrix.ident (S.size nonTargets) - transitionMatrix) Matrix.<\> edgeTimes
+	pure . M.fromList . zipWith (\s t -> (s, realToFrac t)) nonTargetsList $ Matrix.toList expectedTimes
+
+expectedModule :: Module
+expectedModule = synchronousOnlyModule "expected" initialize handleEvent where
+	initialize ctx = do
+		conn <- DB.connectPostgreSQL (db (ctxConfig ctx))
+		expectedsRef <- newIORef Nothing
+		pure (ctx, conn, expectedsRef)
+
+	handleEvent (ctx, conn, expectedsRef) e = case e of
+		Reset{} -> [] <$ writeIORef expectedsRef Nothing
+		Continue e -> do
+			expectedsMaybe <- readIORef expectedsRef
+			expecteds <- case expectedsMaybe of
+				Just expecteds -> pure expecteds
+				Nothing -> do
+					expecteds <- expectedRunTimes ctx conn
+					writeIORef expectedsRef (Just expecteds)
+					pure expecteds
+			pure $ case M.lookup (eState e) expecteds of
+				Nothing -> []
+				Just dt -> [Time (addUTCTime dt (eTime e))]
+
 -- TODO: make this configurable
 allModules :: [Module]
-allModules = [idModule, pbModule, currentPointModule]
+allModules = [idModule, expectedModule, pbModule, currentPointModule]
 
 moduleThread :: Context -> IO loop
 moduleThread ctx = do
