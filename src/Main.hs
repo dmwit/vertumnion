@@ -320,16 +320,13 @@ loggingThread (ctxErrors -> chan) = do
 	dir <- logDir
 	let fp = dir </> show me <.> "log"
 	mh <- try (createDirectoryIfMissing True dir >> openFile fp AppendMode)
-	case mh of
+	h <- case mh of
+		Right h -> h <$ hSetBuffering h LineBuffering
 		Left (_ :: SomeException) -> do
 			hPutStrLn stderr $ "WARNING: Could not open log file " ++ fp ++ " for appending. Logging to stderr"
-			go stderr
-		Right h -> do
-			hSetBuffering h LineBuffering
-			hPutStrLn h (show now ++ ": " ++ err)
-			go h
-	where
-	go h = forever $ do
+			pure stderr
+	hPutStrLn h (show now ++ ": " ++ err)
+	forever $ do
 		err <- readChan chan
 		now <- getCurrentTime
 		hPutStrLn h (show now ++ ": " ++ err)
