@@ -956,7 +956,7 @@ initializeStateCache ctx = case pSortOrder (ctxProfile ctx) of
 			Left err -> pure (const Nothing (DB.sqlState err {- type-checking hint -}))
 			Right conn -> do
 				ss <- DB.query conn
-					"select state from run join split on run.id = split.run where run.game = ? group by state"
+					"select distinct state from run join split on run.id = split.run where run.game = ?"
 					(DB.Only (pGame (ctxProfile ctx)))
 				DB.close conn
 				pure . Just . stateCache ctx . map DB.fromOnly $ ss
