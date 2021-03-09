@@ -167,9 +167,6 @@ data Profile = Profile
 
 type ID = Int32
 
--- TODO: add a function to extract a Maybe (OSet Text), then triage current
--- uses of SortOrder/pSortOrder for ways to use it; reasons: DRY, get compiler
--- warnings if we someday add DescendingOn or something
 data SortOrder = Ascending | Descending | AscendingOn (OSet Text)
 	deriving (Eq, Ord, Read, Show)
 
@@ -188,6 +185,16 @@ soMin so t t' = if soLt so t t' then t else t'
 
 soMax :: SortOrder -> Text -> Text -> Text
 soMax so t t' = if soLt so t t' then t' else t
+
+soAllStates :: SortOrder -> Maybe (OSet Text)
+soAllStates (AscendingOn ss) = Just ss
+-- not a catch-all pattern because I want compiler warnings if constructors get
+-- added later
+soAllStates Ascending = Nothing
+soAllStates Descending = Nothing
+
+ctxAllStates :: Context -> Maybe (OSet Text)
+ctxAllStates = soAllStates . pSortOrder . ctxProfile
 
 defaultableSection :: Text -> Text -> ValueSpec a -> Text -> SectionsSpec (Maybe a)
 defaultableSection sec atom spec help = join <$> C.optSection' sec
@@ -248,16 +255,20 @@ loadProfile profile = do
 	sanityCheckProfile p
 
 sanityCheckProfile :: Profile -> IO Profile
-sanityCheckProfile Profile { pMajorStates = Just states, pSortOrder = AscendingOn tags }
-	| any (`O.notMember` tags) states = fail $ ""
+sanityCheckProfile p
+	| Just tags <- soAllStates (pSortOrder p)
+	, Just states <- pMajorStates p
+	, any (`O.notMember` tags) states = fail $ ""
 		++ "Error in profile: these major states do not appear in the sort order:"
 		++ [ c
 		   | state <- S.toAscList states
 		   , state `O.notMember` tags
 		   , c <- "\n\t" ++ T.unpack state
 		   ]
-sanityCheckProfile Profile { pTarget = state, pSortOrder = AscendingOn tags }
-	| state `O.notMember` tags = fail "Error in profile: target does not appear in the sort order"
+sanityCheckProfile p
+	| Just tags <- soAllStates (pSortOrder p)
+	, pTarget p `O.notMember` tags
+	= fail "Error in profile: target does not appear in the sort order"
 sanityCheckProfile p = pure p
 
 loadConfig :: IO Config
@@ -803,9 +814,7 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 		warnIgnoreStop = writeChan (ctxErrors ctx) "Ignoring redundant STOP"
 
 ctxValidState :: Context -> Text -> Bool
-ctxValidState ctx s = case pSortOrder (ctxProfile ctx) of
-	AscendingOn tags -> O.member s tags
-	_ -> True
+ctxValidState ctx s = maybe True (O.member s) (ctxAllStates ctx)
 
 roundUpToPowerOf2 :: Integer -> Integer
 roundUpToPowerOf2 n
@@ -938,7 +947,10 @@ ctxStates ctx = do
 initializeStateCache :: Context -> IO (Maybe StateCache)
 initializeStateCache ctx = case pSortOrder (ctxProfile ctx) of
 	AscendingOn ss -> pure (Just (Ordered ss))
-	_ -> do
+	Ascending -> fetchFromDB
+	Descending -> fetchFromDB
+	where
+	fetchFromDB = do
 		mConn <- try (DB.connectPostgreSQL (db (ctxConfig ctx)))
 		case mConn of
 			Left err -> pure (const Nothing (DB.sqlState err {- type-checking hint -}))
@@ -1102,16 +1114,13 @@ finishableStates ctx conn
 		(pTarget p, pGame p)
 	where
 	p = ctxProfile ctx
-	restrict ss = case pSortOrder p of
+	restrict ss = case soAllStates (pSortOrder p) of
 		-- paranoia: what if there are two profiles with the same game name?
 		-- (but not quite paranoid enough to deal with two profiles
 		-- with the same game name and shared states. at some point
 		-- you finally have to give in to GIGO)
-		AscendingOn ss' -> S.intersection (O.toSet ss') ss
-		-- explicit matches so the compiler can warn us later if
-		-- DescendingOn becomes a thing or something like that
-		Ascending -> ss
-		Descending -> ss
+		Just ss' -> S.intersection (O.toSet ss') ss
+		Nothing -> ss
 
 -- This produces the expected (in the statistics sense of the term) run time
 -- from all source states that can reach the target to the target. The model
