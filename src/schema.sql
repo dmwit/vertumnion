@@ -14,3 +14,5 @@ create table split (
 	frame integer,
 	primary key (run, seq_no)
 );
+
+/* TODO: indexes */
