@@ -4,6 +4,7 @@
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module Main where
 
 import Config.Schema (SectionsSpec, ValueSpec)
@@ -46,6 +47,7 @@ import Graphics.Rendering.Cairo (Render)
 import Graphics.UI.Gtk
 import Numeric.Natural
 import Options.Applicative
+import System.Clock (Clock(..), TimeSpec(..), getTime)
 import System.Directory
 import System.Environment
 import System.Environment.XDG.BaseDir
@@ -67,6 +69,7 @@ import qualified Data.Text.IO as T
 import qualified Data.Text.Read as T
 import qualified Data.Set.Ordered as O
 import qualified Database.PostgreSQL.Simple as DB
+import qualified Database.PostgreSQL.Simple.FromField as DB
 import qualified Database.PostgreSQL.Simple.ToField as DB
 import qualified Database.PostgreSQL.Simple.Types as DB
 import qualified Graphics.Rendering.Cairo as Cairo
@@ -84,12 +87,12 @@ data Context = Context
 	{ ctxConfig :: Config
 	, ctxProfile :: Profile
 	, ctxErrors :: Chan String
-	, ctxInput :: Chan (UTCTime, Text)
+	, ctxInput :: Chan (TimeSpec, Text)
 	-- TODO: since this is only written from parserThread (right?) it can probably be an IORef
 	, ctxUITimerLabelStatus :: MVar TimerLabelStatus
 	, ctxUITimerLabel :: Label
 	, ctxUIGraph :: DrawingArea
-	, ctxModuleInput :: Chan ModuleEvent
+	, ctxModuleInput :: Chan Command
 	, ctxModuleOutputs :: TVar [(String, TVar [ModulePoint])]
 	, ctxTimeMagnitude :: IORef TimeMagnitude
 	, ctxEventStore :: TreeStore Event
@@ -333,16 +336,16 @@ loggingThread (ctxErrors -> chan) = do
 
 data TimerLabelStatus
 	= BlankTimer
-	| RunningSince UTCTime
-	| Stopped UTCTime UTCTime
+	| RunningSince TimeSpec
+	| Stopped TimeSpec TimeSpec
 	deriving (Eq, Ord, Read, Show)
 
 {-# INLINE string #-}
 string :: String -> String
 string = id
 
-arbitraryTime :: UTCTime
-arbitraryTime = UTCTime (fromOrdinalDate 0 0) 0
+arbitraryTime :: TimeSpec
+arbitraryTime = TimeSpec 0 0
 
 guiThread :: Context -> IO ()
 guiThread ctx = do
@@ -373,7 +376,7 @@ guiThread ctx = do
 		case eFrame e of
 			Nothing -> pure ""
 			Just n -> do
-				let (mag', content) = showNominalDiffTime (fromInteger n / realToFrac fps) mag
+				let (mag', content) = showDiffTimeSpec (fromInteger n / realToFrac fps) mag
 				when (mag /= mag') $ do
 					writeIORef (ctxTimeMagnitude ctx) mag'
 					redrawAllIntervals ctx
@@ -454,10 +457,10 @@ renderGraph ctx = do
 			Nothing -> const True
 			Just ss -> (`S.member` ss)
 
-		xPos :: UTCTime -> Double
+		xPos :: TimeSpec -> Double
 		xPos = timePos tb
 
-		coordDiffPos :: NominalDiffTime -> Double
+		coordDiffPos :: DiffTimeSpec -> Double
 		coordDiffPos = diffTimePos tb
 
 		yPos :: Dependent -> Double
@@ -500,13 +503,12 @@ renderGraph ctx = do
 		Cairo.fill
 
 data TimeBounds = TimeBounds
-	{ tbZero :: UTCTime
-	, tbGridLine :: NominalDiffTime
-	, tbMax :: NominalDiffTime
+	{ tbZero :: TimeSpec
+	, tbGridLine :: DiffTimeSpec
+	, tbMax :: DiffTimeSpec
 	} deriving (Eq, Ord, Read, Show)
 
--- [LPS]
-chooseTimeBounds :: [UTCTime] -> TimeBounds
+chooseTimeBounds :: [TimeSpec] -> TimeBounds
 chooseTimeBounds [] = TimeBounds
 	{ tbZero = arbitraryTime
 	, tbGridLine = 1
@@ -519,7 +521,7 @@ chooseTimeBounds ts = TimeBounds
 	} where
 	zero = minimum ts
 	big = maximum ts
-	bigDiff = diffUTCTime big zero
+	bigDiff = diffTimeSpec big zero
 	gridTarget = bigDiff / 10
 	grid = case S.lookupGE gridTarget roundIntervals of
 		Just v -> v
@@ -531,23 +533,22 @@ chooseTimeBounds ts = TimeBounds
 		| otherwise = cur
 	bigAndRound = fromInteger (ceiling (bigDiff / grid)) * grid
 
-roundIntervals :: Set NominalDiffTime
+roundIntervals :: Set DiffTimeSpec
 roundIntervals = S.fromList
 	[      1,       2,       5,       10,       30 -- seconds
 	,   60*1,    60*2,    60*5,    60*10,    60*30 -- minutes
 	,60*60*1, 60*60*2, 60*60*6, 60*60*12           -- hours
 	]
 
--- [LPS]
-timePos :: TimeBounds -> UTCTime -> Double
-timePos tb t = diffTimePos tb (diffUTCTime t (tbZero tb))
+timePos :: TimeBounds -> TimeSpec -> Double
+timePos tb t = diffTimePos tb (diffTimeSpec t (tbZero tb))
 
--- [LPS]
-diffTimePos :: TimeBounds -> NominalDiffTime -> Double
+diffTimePos :: TimeBounds -> DiffTimeSpec -> Double
 diffTimePos tb d = if tbMax tb == 0
 	then 0.5
 	else realToFrac (d / tbMax tb)
 
+-- | The 'Word8' is how many digits there are.
 data TimeMagnitude = Seconds | Minutes | Hours | Days Word8 deriving (Eq, Ord, Read, Show)
 
 updateTimerLabel :: Context -> IO ()
@@ -555,7 +556,7 @@ updateTimerLabel ctx = postGUIAsync $ do
 	status <- readMVar (ctxUITimerLabelStatus ctx)
 	case status of
 		BlankTimer -> go commonAttrs arbitraryTime arbitraryTime
-		RunningSince from -> go runningAttrs from =<< getCurrentTime
+		RunningSince from -> go runningAttrs from =<< getCurrentTimeSpec
 		Stopped from to -> go stoppedAttrs from to
 	where
 	commonAttrs = tail [undefined
@@ -583,9 +584,47 @@ updateTimerLabel ctx = postGUIAsync $ do
 updateGraph :: Context -> IO ()
 updateGraph = postGUIAsync . widgetQueueDraw . ctxUIGraph
 
--- [LPS]
-showInterval :: UTCTime -> UTCTime -> TimeMagnitude -> (TimeMagnitude, String)
-showInterval old new = showNominalDiffTime (diffUTCTime new old)
+-- 2^63 microseconds is about 300k years, so even though this technically can't
+-- represent all the possible TimeSpec differences, it's gonna be good enough
+-- for this application.
+
+-- TODO: Read and Show instances that put the decimal point in the right place
+newtype DiffTimeSpec = DiffTimeSpec { getMicros :: Int64 } deriving (Eq, Ord, Read, Show, Enum, DB.FromField, DB.ToField)
+
+-- | @fromInteger 1@ is one second
+instance Num DiffTimeSpec where
+	DiffTimeSpec a + DiffTimeSpec b = DiffTimeSpec (a+b)
+	DiffTimeSpec a - DiffTimeSpec b = DiffTimeSpec (a-b)
+	DiffTimeSpec a * DiffTimeSpec b = DiffTimeSpec (fromInteger ((toInteger a * toInteger b + 500000) `div` 1000000))
+	negate (DiffTimeSpec a) = DiffTimeSpec (negate a)
+	abs (DiffTimeSpec a) = DiffTimeSpec (abs a)
+	signum (DiffTimeSpec a) = DiffTimeSpec (1000000 * signum a)
+	fromInteger n = DiffTimeSpec (fromInteger (1000000 * n))
+
+instance Real DiffTimeSpec where
+	toRational (DiffTimeSpec a) = toRational a / 1000000
+
+instance Fractional DiffTimeSpec where
+	DiffTimeSpec a / DiffTimeSpec b = DiffTimeSpec ((a*1000000 + b`div`2) `div` b)
+	recip (DiffTimeSpec a) = DiffTimeSpec ((1000000000000 + a `div` 2) `div` a)
+	fromRational n = DiffTimeSpec (round (n*1000000))
+
+instance RealFrac DiffTimeSpec where
+	properFraction (DiffTimeSpec a) = (fromIntegral q, DiffTimeSpec r) where
+		(q, r) = a `quotRem` 1000000
+
+diffTimeSpec :: TimeSpec -> TimeSpec -> DiffTimeSpec
+diffTimeSpec (TimeSpec s ns) (TimeSpec s' ns') = DiffTimeSpec $
+	1000000*(s-s') + (ns-ns'+500000)`div`1000
+
+addTimeSpec :: DiffTimeSpec -> TimeSpec -> TimeSpec
+addTimeSpec (DiffTimeSpec micros) ts = ts + fromIntegral (1000*micros)
+
+showInterval :: TimeSpec -> TimeSpec -> TimeMagnitude -> (TimeMagnitude, String)
+showInterval old new = showDiffTimeSpec (diffTimeSpec new old)
+
+showDiffTimeSpec :: DiffTimeSpec -> TimeMagnitude -> (TimeMagnitude, String)
+showDiffTimeSpec = showNominalDiffTime . realToFrac
 
 showNominalDiffTime :: NominalDiffTime -> TimeMagnitude -> (TimeMagnitude, String)
 showNominalDiffTime dur mag_ = (mag, formatTime defaultTimeLocale (formatString mag) dur) where
@@ -613,19 +652,22 @@ formatString (Days n) = "%0" ++ show n ++ "dd " ++ formatString Hours
 redrawAllIntervals :: Context -> IO ()
 redrawAllIntervals _ = pure ()
 
+getCurrentTimeSpec :: IO TimeSpec
+getCurrentTimeSpec = getTime MonotonicRaw
+
 stdinThread :: Context -> IO loop
 stdinThread (ctxInput -> chan) = forever $ do
 	line <- T.getLine
-	now <- getCurrentTime
+	now <- getCurrentTimeSpec
 	writeChan chan (now, line)
 
 data Event = Event
 	{ eFrame :: Maybe Integer
-	, eTime :: UTCTime
+	, eTime :: TimeSpec
 	, eState :: Text
 	} deriving (Eq, Ord, Read, Show)
 
-data Command = StateChange Event | Stop UTCTime deriving (Eq, Ord, Read, Show)
+data Command = StateChange Event | Stop TimeSpec deriving (Eq, Ord, Read, Show)
 
 stop :: Text
 stop = "STOP"
@@ -711,16 +753,17 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 
 		broadcast event splitKey continue won = do
 			-- tell the database
-			(runID, seqNo) <- case splitKey of
-				Just (runID, seqNo) -> pure (runID, seqNo+1)
+			(runID, startTimeSpec, seqNo) <- case splitKey of
+				Just (runID, startTimeSpec, seqNo) -> pure (runID, startTimeSpec, seqNo+1)
 				Nothing -> do
 					[DB.Only runID] <- DB.query conn
-						"insert into run (game, fps) values (?, ?) returning id"
+						"insert into run (game, fps, started) values (?, ?, now()) returning id"
 						(pGame (ctxProfile ctx), pFPS (ctxProfile ctx))
-					pure (runID :: ID, 0 :: ID)
+					pure (runID :: ID, eTime event, 0 :: ID)
+			let microsecond = diffTimeSpec (eTime event) startTimeSpec
 			DB.execute conn
-				"insert into split (run, seq_no, state, moment, frame) values (?, ?, ?, ?, ?)"
-				(runID, seqNo, eState event, eTime event, eFrame event)
+				"insert into split (run, seq_no, state, microsecond, frame) values (?, ?, ?, ?, ?)"
+				(runID, seqNo, eState event, microsecond, eFrame event)
 
 			-- tell the UI
 			atomically $ do
@@ -739,12 +782,12 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 				logEvent ctx event
 
 			-- tell the modules
-			writeChan (ctxModuleInput ctx) (Continue event)
+			writeChan (ctxModuleInput ctx) (StateChange event)
 
 			-- tell the parser thread
 			if eState event == pTarget (ctxProfile ctx)
 			then stopTimer (eTime event) >> won
-			else continue (runID, seqNo)
+			else continue (runID, startTimeSpec, seqNo)
 
 		stopTimer now = do
 			-- nothing interesting to tell the database
@@ -754,7 +797,7 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 				RunningSince before -> Stopped before now
 				_ -> status
 			-- tell the modules
-			writeChan (ctxModuleInput ctx) (Reset now)
+			writeChan (ctxModuleInput ctx) (Stop now)
 			-- the parser thread already knows
 
 		warnIgnoreStop = writeChan (ctxErrors ctx) "Ignoring redundant STOP"
@@ -913,28 +956,23 @@ heartbeatThread ctx = forever $ do
 
 data Dependent
 	= State Text
-	| Time UTCTime
+	| Time TimeSpec
 	deriving (Eq, Ord, Read, Show)
 
 data ModulePoint = ModulePoint
-	{ x :: UTCTime
+	{ x :: TimeSpec
 	, y :: Dependent
 	} deriving (Eq, Ord, Read, Show)
 
-data ModuleEvent
-	= Reset UTCTime
-	| Continue Event
-	deriving (Eq, Ord, Read, Show)
-
 data Module = Module
 	{ mLabel :: String
-	, mLaunch :: Context -> Chan ModuleEvent -> TVar [ModulePoint] -> IO Void
+	, mLaunch :: Context -> Chan Command -> TVar [ModulePoint] -> IO Void
 	}
 
 -- | If your module only ever adds points, and only needs to see the latest
 -- event to know which points it wants to add, you can use this wrapper to do
 -- some of the bookkeeping for you.
-appendOnlyModule :: String -> (Context -> IO a) -> (a -> ModuleEvent -> IO [ModulePoint]) -> Module
+appendOnlyModule :: String -> (Context -> IO a) -> (a -> Command -> IO [ModulePoint]) -> Module
 appendOnlyModule label initialize newPoints = Module label $ \ctx i o -> do
 	a <- initialize ctx
 	let go pts = do
@@ -945,28 +983,28 @@ appendOnlyModule label initialize newPoints = Module label $ \ctx i o -> do
 	    		atomically (writeTVar o pts')
 	    		updateGraph ctx
 	    	go $ case me of
-	    		Reset{} -> []
-	    		Continue{} -> pts'
+	    		Stop{} -> []
+	    		StateChange{} -> pts'
 	go []
 
 -- | If you meet the requirements of 'appendOnlyModule', and additionally your
 -- new points always occur at the same time as the most recent event, you can
 -- use this to add the x-coordinate for you.
-synchronousOnlyModule :: String -> (Context -> IO a) -> (a -> ModuleEvent -> IO [Dependent]) -> Module
+synchronousOnlyModule :: String -> (Context -> IO a) -> (a -> Command -> IO [Dependent]) -> Module
 synchronousOnlyModule label initialize newDependents
 	= appendOnlyModule label initialize $ \a me ->
 		map (ModulePoint (meTime me)) <$> newDependents a me
 	where
-	meTime (Continue e) = eTime e
-	meTime (Reset t) = t
+	meTime (StateChange e) = eTime e
+	meTime (Stop t) = t
 
 eventProgressModule :: Module
 eventProgressModule = synchronousOnlyModule "event progress" def
-	$ \ ~() me -> pure [State (eState e) | Continue e <- [me]]
+	$ \ ~() me -> pure [State (eState e) | StateChange e <- [me]]
 
 timeProgressModule :: Module
 timeProgressModule = synchronousOnlyModule "time progress" def
-	$ \ ~() me -> pure [Time (eTime e) | Continue e <- [me]]
+	$ \ ~() me -> pure [Time (eTime e) | StateChange e <- [me]]
 
 pbModule :: Module
 pbModule = synchronousOnlyModule "PB" initialize addPBRun
@@ -982,36 +1020,35 @@ pbModule = synchronousOnlyModule "PB" initialize addPBRun
 		pure (pbRef, eConn, pGame (ctxProfile ctx), pTarget (ctxProfile ctx))
 
 	addPBRun (_, Left err, _, _) _ = pure []
-	addPBRun (pbRef, _, _, _) Reset{} = [] <$ writeIORef pbRef Nothing
-	addPBRun a@(pbRef, Right conn, game, tgt) me@(Continue e) = do
+	addPBRun (pbRef, _, _, _) Stop{} = [] <$ writeIORef pbRef Nothing
+	addPBRun a@(pbRef, Right conn, game, tgt) me@(StateChange e) = do
 		mPB <- readIORef pbRef
 		case mPB of
 			Just pb -> pure $ case M.lookup (eState e) pb of
 				Nothing -> []
-				-- [LPS]
-				Just t -> [Time (addUTCTime (diffUTCTime (pb M.! tgt) t) (eTime e))]
+				Just t -> [Time (addTimeSpec ((pb M.! tgt) - t) (eTime e))]
 			Nothing -> do
-				runs <- DB.query @_ @(ID, CalendarDiffTime) conn findPBRunQuery (eState e, tgt, game)
+				runs <- DB.query @_ @(ID, DiffTimeSpec) conn findPBRunQuery (eState e, tgt, game)
 				pb <- case runs of
 					[] -> pure M.empty
 					(runID, _):_ -> M.fromList <$> DB.query conn
-						"select state, min(moment) from split where run = '?' group by state"
+						"select state, min(microsecond) from split where run = '?' group by state"
 						(DB.Only runID)
 				writeIORef pbRef (Just pb)
 				addPBRun a me
 
 	findPBRunQuery = "\
-		\select min(b_run), e_moment - b_moment as duration \
+		\select b_run, e_microsecond - b_microsecond as duration \
 		\from \
 			\(\
 				\(\
-					\select run as b_run, moment as b_moment, seq_no as b_seq_no \
+					\select run as b_run, microsecond as b_microsecond, seq_no as b_seq_no \
 					\from split \
 					\where state = ? \
 				\) as beginning \
 				\join \
 				\( \
-					\select run as e_run, moment as e_moment, seq_no as e_seq_no \
+					\select run as e_run, microsecond as e_microsecond, seq_no as e_seq_no \
 					\from split \
 					\where state = ? \
 				\) as ending \
@@ -1021,8 +1058,7 @@ pbModule = synchronousOnlyModule "PB" initialize addPBRun
 			\run \
 			\on interval.b_run = run.id \
 		\where run.game = ? \
-		\group by duration \
-		\order by duration \
+		\order by duration, b_run \
 		\limit 1"
 
 currentPointModule :: Module
@@ -1031,8 +1067,8 @@ currentPointModule = Module "now" $ \ctx i o -> do
 	forkIO . forever $ do
 		me <- readChan i
 		case me of
-			Continue e -> atomically $ writeTVar curStateVar (Just (eState e), Nothing)
-			Reset t -> atomically $ writeTVar curStateVar (Nothing, Just t)
+			StateChange e -> atomically $ writeTVar curStateVar (Just (eState e), Nothing)
+			Stop t -> atomically $ writeTVar curStateVar (Nothing, Just t)
 	forever $ do
 		curState <- atomically $ do
 			pts <- readTVar o
@@ -1040,7 +1076,7 @@ currentPointModule = Module "now" $ \ctx i o -> do
 			-- pause in between runs
 			when (pts == pointsFor arbitraryTime curState) retry
 			pure curState
-		now <- getCurrentTime
+		now <- getCurrentTimeSpec
 		atomically $ writeTVar o (pointsFor now curState)
 		updateGraph ctx
 		threadDelay (1000000`div`30) -- update at 30fps...ish
@@ -1109,13 +1145,13 @@ finishableStates ctx conn
 -- collection of linear equations with E⎡S  → T⎤ as the variables. We can
 --                                      ⎣ i    ⎦
 -- estimate these expectations by solving the system of linear equations.
-expectedRunTimes :: Context -> Connection -> IO (Map Text NominalDiffTime)
+expectedRunTimes :: Context -> Connection -> IO (Map Text DiffTimeSpec)
 expectedRunTimes ctx conn = do
 	ss <- finishableStates ctx conn
 	let target = pTarget (ctxProfile ctx)
 	    nonTargets = S.delete target ss
 	stats_ <- DB.query conn
-		"select f.state, t.state, count(*), sum(t.moment - f.moment) \
+		"select f.state, t.state, count(*), sum(t.microsecond - f.microsecond) \
 		\from split as f \
 		\join split as t \
 		\on f.run = t.run and f.seq_no+1 = t.seq_no and f.state in ? and t.state in ? \
@@ -1123,15 +1159,12 @@ expectedRunTimes ctx conn = do
 		\on f.run = id and game = ? \
 		\group by f.state, t.state"
 		(DB.In . S.toList $ nonTargets, DB.In . S.toList $ ss, pGame (ctxProfile ctx))
-	maps <- for stats_ $ \row@(from, to, n, CalendarDiffTime months dur) -> do
-		when (months /= 0) . writeChan (ctxErrors ctx) $ printf
-			"Saw non-zero amount of months in expectedRunTimes; offending row: %s"
-			(show row)
+	maps <- for stats_ $ \row@(from, to, n, dur) -> do
 		pure
 			. M.singleton from
 			. M.singleton to
-			$ ( (fromIntegral :: Int64 -> Double) n
-			  , (realToFrac :: NominalDiffTime -> Double) dur
+			$ ( fromIntegral (n :: Int64)
+			  , fromRational dur / 1000000
 			  )
 	let stats = M.unionsWith (M.unionWith pointwiseAddition) maps
 	    pointwiseAddition (n, dur) (n', dur') = (n+n', dur+dur')
@@ -1171,8 +1204,8 @@ expectedModule = synchronousOnlyModule "expected" initialize handleEvent where
 		pure (ctx, conn, expectedsRef)
 
 	handleEvent (ctx, conn, expectedsRef) e = case e of
-		Reset{} -> [] <$ writeIORef expectedsRef Nothing
-		Continue e -> do
+		Stop{} -> [] <$ writeIORef expectedsRef Nothing
+		StateChange e -> do
 			expectedsMaybe <- readIORef expectedsRef
 			expecteds <- case expectedsMaybe of
 				Just expecteds -> pure expecteds
@@ -1182,7 +1215,7 @@ expectedModule = synchronousOnlyModule "expected" initialize handleEvent where
 					pure expecteds
 			pure $ case M.lookup (eState e) expecteds of
 				Nothing -> []
-				Just dt -> [Time (addUTCTime dt (eTime e))]
+				Just dt -> [Time (addTimeSpec dt (eTime e))]
 
 -- TODO: make this configurable
 allModules :: [Module]
@@ -1199,9 +1232,3 @@ moduleThread ctx = do
 	forever $ do
 		mEvent <- readChan (ctxModuleInput ctx)
 		for_ chans $ \chan -> writeChan chan mEvent
-
--- TODO: lmao leap seconds. grep for [LPS]
--- Marc suggests using the monotonic clock provided by the CPU. This would
--- neatly deal with the leap second issue, and would also not have the problems
--- that the current solution has with NTP and the like. Check out the clock
--- package; MonotonicCoarse is probably good enough for my needs.

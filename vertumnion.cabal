@@ -25,6 +25,7 @@ executable vertumnion
                        , ansi-wl-pprint ^>=0.6
                        , bytestring ^>=0.10
                        , cairo ^>=0.13
+                       , clock ^>=0.8
                        , colour ^>=2.3
                        , config-schema ^>=1.2
                        , config-value ^>=0.8
