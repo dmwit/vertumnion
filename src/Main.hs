@@ -1,10 +1,10 @@
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE ViewPatterns #-}
 module Main where
 
 import Config.Schema (SectionsSpec, ValueSpec)
