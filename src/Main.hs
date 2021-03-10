@@ -26,6 +26,7 @@ import Data.Containers.ListUtils
 import Data.Default
 import Data.Foldable
 import Data.Functor.Alt ((<!>))
+import Data.String
 import Data.Tree
 import Data.Int
 import Data.IORef
@@ -71,6 +72,7 @@ import qualified Data.Set.Ordered as O
 import qualified Database.PostgreSQL.Simple as DB
 import qualified Database.PostgreSQL.Simple.FromField as DB
 import qualified Database.PostgreSQL.Simple.ToField as DB
+import qualified Database.PostgreSQL.Simple.ToRow as DB
 import qualified Database.PostgreSQL.Simple.Types as DB
 import qualified Graphics.Rendering.Cairo as Cairo
 import qualified Numeric.LinearAlgebra as Matrix
@@ -1225,6 +1227,58 @@ expectedModule = synchronousOnlyModule "expected" initialize handleEvent where
 			pure $ case M.lookup (eState e) expecteds of
 				Nothing -> []
 				Just dt -> [Time (addTimeSpec dt (eTime e))]
+
+newtype HetRow = HetRow ([DB.Action] -> [DB.Action])
+
+hetField :: DB.ToField a => a -> HetRow
+hetField a = HetRow (DB.toField a:)
+
+hetRow :: DB.ToRow a => a -> HetRow
+hetRow a = HetRow (DB.toRow a ++)
+
+instance DB.ToRow HetRow where
+	toRow (HetRow f) = f []
+
+instance Semigroup HetRow where HetRow f <> HetRow g = HetRow (f . g)
+instance Monoid HetRow where mempty = HetRow id
+
+randomNextStates ::
+	Context -> Connection ->
+	[Text] -> Map Int Text -> IO (Map Int (Text, DiffTimeSpec))
+randomNextStates ctx conn finishable states = do
+	toMap <$> DB.query conn nextStateQuery (currentStates DB.:. otherParameters)
+	where
+	toMap results = M.fromList [(n, (s, dur)) | (n, s, dur) <- results]
+	currentStates = M.foldMapWithKey (\i s -> hetRow (i, s)) states
+	game = pGame (ctxProfile ctx)
+	otherParameters = (game, DB.In finishable, game, DB.In finishable)
+	nextStateQuery = fromString $ ""
+		-- using this with/as construction prevents the random column from
+		-- being re-randomized many times as the query executes
+		++ "with indexed_source as\
+		    	\(\
+		    	\select id, state, floor(1+max_index*random()) as index \
+		    	\from (values"
+		++ intercalate "," (replicate (M.size states) "(?, ?)")
+		++  	") as source (id, state) \
+		    	\join\
+		    	\( \
+		    		\select f_state, count(*) as max_index \
+		    		\from segment \
+		    		\where game = ? and t_state in ? \
+		    		\group by f_state\
+		    	\) as state_count \
+		    	\on source.state = state_count.f_state\
+		    	\)\
+		    \select id, t_state, duration from\
+		    	\(\
+		    		\select f_state, t_state, duration, row_number() over (partition by f_state) as index \
+		    		\from segment \
+		    		\where game = ? and t_state in ?\
+		    	\) as indexed_segment \
+		    	\join \
+		    	\indexed_source \
+		    	\on indexed_segment.f_state = indexed_source.state and indexed_segment.index = indexed_source.index"
 
 -- TODO: make this configurable
 allModules :: [Module]
