@@ -355,8 +355,8 @@ data TimerLabelStatus
 string :: String -> String
 string = id
 
-arbitraryTime :: TimeSpec
-arbitraryTime = TimeSpec 0 0
+arbitraryTimeSpec :: TimeSpec
+arbitraryTimeSpec = TimeSpec 0 0
 
 guiThread :: Context -> IO ()
 guiThread ctx = do
@@ -521,7 +521,7 @@ data TimeBounds = TimeBounds
 
 chooseTimeBounds :: [TimeSpec] -> TimeBounds
 chooseTimeBounds [] = TimeBounds
-	{ tbZero = arbitraryTime
+	{ tbZero = arbitraryTimeSpec
 	, tbGridLine = 1
 	, tbMax = 10
 	}
@@ -566,7 +566,7 @@ updateTimerLabel :: Context -> IO ()
 updateTimerLabel ctx = postGUIAsync $ do
 	status <- readMVar (ctxUITimerLabelStatus ctx)
 	case status of
-		BlankTimer -> go commonAttrs arbitraryTime arbitraryTime
+		BlankTimer -> go commonAttrs arbitraryTimeSpec arbitraryTimeSpec
 		RunningSince from -> go runningAttrs from =<< getCurrentTimeSpec
 		Stopped from to -> go stoppedAttrs from to
 	where
@@ -1086,7 +1086,7 @@ currentPointModule = Module "now" $ \ctx i o -> do
 			pts <- readTVar o
 			curState <- readTVar curStateVar
 			-- pause in between runs
-			when (pts == pointsFor arbitraryTime curState) retry
+			when (pts == pointsFor arbitraryTimeSpec curState) retry
 			pure curState
 		now <- getCurrentTimeSpec
 		atomically $ writeTVar o (pointsFor now curState)
