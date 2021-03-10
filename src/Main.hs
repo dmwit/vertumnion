@@ -626,7 +626,7 @@ instance RealFrac DiffTimeSpec where
 
 diffTimeSpec :: TimeSpec -> TimeSpec -> DiffTimeSpec
 diffTimeSpec (TimeSpec s ns) (TimeSpec s' ns') = DiffTimeSpec $
-	1000000*(s-s') + (ns-ns'+500000)`div`1000
+	1000000*(s-s') + (ns-ns'+500)`div`1000
 
 addTimeSpec :: DiffTimeSpec -> TimeSpec -> TimeSpec
 addTimeSpec (DiffTimeSpec micros) ts = ts + fromIntegral (1000*micros)
