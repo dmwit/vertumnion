@@ -616,7 +616,7 @@ instance Real DiffTimeSpec where
 	toRational (DiffTimeSpec a) = toRational a / 1000000
 
 instance Fractional DiffTimeSpec where
-	DiffTimeSpec a / DiffTimeSpec b = DiffTimeSpec ((a*1000000 + b`div`2) `div` b)
+	DiffTimeSpec a / DiffTimeSpec b = DiffTimeSpec ((a*1000000 + b `div` 2) `div` b)
 	recip (DiffTimeSpec a) = DiffTimeSpec ((1000000000000 + a `div` 2) `div` a)
 	fromRational n = DiffTimeSpec (round (n*1000000))
 
