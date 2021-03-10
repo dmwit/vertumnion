@@ -1107,11 +1107,10 @@ finishableStates ctx conn
 		"with recursive finishable(state) as (\
 			\values (?) \
 			\union \
-			\select f.state \
-			\from split as t \
-			\join finishable on t.state = finishable.state \
-			\join run on run = id and game = ? \
-			\join split as f on f.run = t.run and f.seq_no+1 = t.seq_no\
+			\select f_state as state \
+			\from segment \
+			\join finishable \
+			\on game = ? and t_state = finishable.state \
 		\) select state from finishable"
 		(pTarget p, pGame p)
 	where
@@ -1162,13 +1161,10 @@ expectedRunTimes ctx conn = do
 	let target = pTarget (ctxProfile ctx)
 	    nonTargets = S.delete target ss
 	stats_ <- DB.query conn
-		"select f.state, t.state, count(*), sum(t.microsecond - f.microsecond) \
-		\from split as f \
-		\join split as t \
-		\on f.run = t.run and f.seq_no+1 = t.seq_no and f.state in ? and t.state in ? \
-		\join run \
-		\on f.run = id and game = ? \
-		\group by f.state, t.state"
+		"select f_state, t_state, count(*), sum(t_microsecond - f_microsecond) \
+		\from segment \
+		\where f_state in ? and t_state in ? and game = ? \
+		\group by f_state, t_state"
 		(DB.In . S.toList $ nonTargets, DB.In . S.toList $ ss, pGame (ctxProfile ctx))
 	maps <- for stats_ $ \row@(from, to, n, dur) -> do
 		pure
