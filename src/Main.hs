@@ -565,6 +565,93 @@ diffTimePos tb d = if tbMax tb == 0
 	then 0.5
 	else realToFrac (d / tbMax tb)
 
+data LogScaleBounds = LogScaleBounds
+	{ lsbZero :: Double
+	, lsbScale :: Double
+	, lsbOffset :: Double
+	, lsbGridLines :: [Double]
+	} deriving (Eq, Ord, Read, Show)
+
+chooseLogScaleBounds :: [Double] -> LogScaleBounds
+chooseLogScaleBounds ns
+	| null ns = LogScaleBounds
+		{ lsbZero = 1
+		, lsbScale = recip (log 10)
+		, lsbOffset = 0
+		, lsbGridLines = [1, 2, 5, 10]
+		}
+	| all (< 0) ns = let lsb = chooseLogScaleBounds (negate <$> ns) in LogScaleBounds
+		{ lsbZero = -lsbZero lsb
+		, lsbScale = -lsbScale lsb
+		, lsbGridLines = negate <$> lsbGridLines lsb
+		, lsbOffset = 1
+		}
+	| any (<= 0) ns = chooseLogScaleBounds (filter (>0) ns)
+	| otherwise = LogScaleBounds
+		{ lsbZero = zero
+		, lsbScale = recip (log (one/zero))
+		, lsbOffset = 0
+		, lsbGridLines = gridLines
+		} where
+		small = minimum ns
+		big = maximum ns
+
+		oom x = floor (logBase 10 x)
+		logMags@[smallLogMag, bigLogMag] = map oom [small, big]
+		mags@[smallMag, bigMag] = map (10^^) logMags
+		[smallRatio, bigRatio] = zipWith (/) [small, big] mags
+
+		smallRoundRatio = fromMaybe 1 (S.lookupLE smallRatio roundDigits)
+		bigRoundRatio = fromMaybe 10 (S.lookupGE bigRatio roundDigits)
+
+		zero = smallRoundRatio * smallMag
+		one = bigRoundRatio * bigMag
+
+		allGrids = S.toAscList . S.fromList $
+			[ gridLine
+			-- bigLogMag is sometimes too small by 1 due to rounding, so
+			-- include 10 as a choice of coefficient
+			| ratio <- 10 : S.toList roundDigits
+			, mag <- [smallLogMag..bigLogMag]
+			, let gridLine = ratio*10^^mag
+			, zero <= gridLine && gridLine <= one
+			]
+		gridLines = chooseAFewEvenly allGrids
+
+logScalePos :: LogScaleBounds -> Double -> Double
+logScalePos lsb n = lsbOffset lsb + log (n/lsbZero lsb) * lsbScale lsb
+
+chooseAFewEvenly :: [a] -> [a]
+chooseAFewEvenly as
+	| lines <= 6 = as
+	| otherwise = head $ []
+		++ [ every (gaps `quot` n) as
+		   | n <- [5, 4, 3]
+		   , gaps `rem` n == 0
+		   ]
+		++ [ indices [ (numerator * (lines-1) + 2) `quot` 4
+		             | numerator <- [0 .. 4]
+		             ]
+		   ]
+	where
+	lines = length as
+	gaps = lines-1
+
+	every n [] = []
+	every n (x:xs) = x : every n (drop (n-1) xs)
+
+	indices = go 0 as where
+		go _ [] _ = []
+		go _ _ [] = []
+		go i (x:xs) is@(i':is') = case compare i i' of
+			LT -> go (i+1) xs is
+			EQ -> x : go (i+1) xs is'
+			-- should be impossible, but...
+			GT -> if i' < 0 then go i (x:xs) is' else go 0 as is
+
+roundDigits :: Set Double
+roundDigits = S.fromList [1, 2, 5]
+
 -- | The 'Word8' is how many digits there are.
 data TimeMagnitude = Seconds | Minutes | Hours | Days Word8 deriving (Eq, Ord, Read, Show)
 
