@@ -1163,11 +1163,11 @@ finishableStates (ctxProfile -> p) = id
 	. ap (zipWith predecessor) tail
 	. sort
 	where
+	-- paranoia: what if there are two profiles with the same game name? (but
+	-- not quite paranoid enough to deal with two profiles with the same game
+	-- name and shared states. at some point you finally have to give in to
+	-- GIGO)
 	restrict ss = case soAllStates (pSortOrder p) of
-		-- paranoia: what if there are two profiles with the same game name?
-		-- (but not quite paranoid enough to deal with two profiles
-		-- with the same game name and shared states. at some point
-		-- you finally have to give in to GIGO)
 		Just ss' -> S.intersection (O.toSet ss') ss
 		Nothing -> ss
 
