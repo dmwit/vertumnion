@@ -1138,30 +1138,35 @@ data Segment = Segment
 	, frames :: Maybe Int32
 	} deriving (Eq, Ord, Read, Show)
 
-allSegments :: [Split] -> Map Text [Segment]
-allSegments = id
+finishableSegments :: Context -> [Split] -> Map Text [Segment]
+finishableSegments ctx splits = id
 	. M.fromListWith (++)
 	. concat
 	. ap (zipWith mkSegment) tail
-	. sort
+	$ sorted
 	where
+	sorted = sort splits
+	finishable = unsafeFinishableStates ctx sorted
 	mkSegment split split' =
 		[(state split, [Segment
 			{ endState = state split'
 			, duration = microsecond split' - microsecond split
 			, frames = liftA2 (-) (frame split') (frame split)
 			}])
-		| run split == run split' && seqNo split + 1 == seqNo split'
+		| run split == run split'
+		, seqNo split + 1 == seqNo split'
+		, state split `S.member` finishable
+		, state split' `S.member` finishable
 		]
 
-finishableStates :: Context -> [Split] -> Set Text
-finishableStates (ctxProfile -> p) = id
+-- unsafe because it assumes the provided split list is already sorted
+unsafeFinishableStates :: Context -> [Split] -> Set Text
+unsafeFinishableStates (ctxProfile -> p) = id
 	. restrict
 	. dfs (pTarget p)
 	. M.fromListWith (++)
 	. concat
 	. ap (zipWith predecessor) tail
-	. sort
 	where
 	-- paranoia: what if there are two profiles with the same game name? (but
 	-- not quite paranoid enough to deal with two profiles with the same game
@@ -1215,10 +1220,10 @@ dfs root neighbors = go root (S.singleton root) where
 expectedRunTimes :: Context -> Connection -> IO (Map Text DiffTimeSpec)
 expectedRunTimes ctx conn = do
 	splits <- allSplits ctx conn
-	let ss = finishableStates ctx splits
-	    target = pTarget (ctxProfile ctx)
-	    nonTargets = S.delete target ss
-	    stats = summarize <$> allSegments splits
+	let target = pTarget (ctxProfile ctx)
+	    stats = summarize <$> finishableSegments ctx splits
+	    ss = S.insert target (M.keysSet stats)
+	    nonTargets = S.delete target ss -- N.B. (S.delete k . S.insert k) is not necessarily id
 	    -- this does all the addition in the world of exact integers, then at
 	    -- the last second converts to Double; this avoids rounding issues to
 	    -- the extent possible (at the unlikely cost of overflow issues)
