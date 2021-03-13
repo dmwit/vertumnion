@@ -41,6 +41,7 @@ import Data.Text (Text)
 import Data.Time
 import Data.Time.Calendar.OrdinalDate
 import Data.Traversable
+import Data.Vector (Vector)
 import Data.Void
 import Data.Word
 import Database.PostgreSQL.Simple (Connection)
@@ -57,6 +58,7 @@ import System.FilePath
 import System.Glib.UTFString
 import System.IO
 import System.Posix.Process (getProcessID)
+import System.Random
 import Text.Printf (printf)
 import qualified Config as C
 import qualified Config.Schema as C
@@ -64,14 +66,16 @@ import qualified Config.Macro as C
 import qualified Data.ByteString as BS
 import qualified Data.Map as M
 import qualified Data.Set as S
+import qualified Data.Set.Ordered as O
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.Text.IO as T
 import qualified Data.Text.Read as T
-import qualified Data.Set.Ordered as O
+import qualified Data.Vector as V
 import qualified Database.PostgreSQL.Simple as DB
 import qualified Database.PostgreSQL.Simple.FromField as DB
 import qualified Database.PostgreSQL.Simple.ToField as DB
+import qualified Database.PostgreSQL.Simple.FromRow as DB
 import qualified Database.PostgreSQL.Simple.ToRow as DB
 import qualified Database.PostgreSQL.Simple.Types as DB
 import qualified Graphics.Rendering.Cairo as Cairo
@@ -1101,20 +1105,64 @@ currentPointModule = Module "now" $ \ctx i o -> do
 		, dep <- [State s, Time t]
 		] where t = fromMaybe tDef mt
 
-finishableStates :: Context -> Connection -> IO (Set Text)
-finishableStates ctx conn
-	= restrict . S.fromList . map DB.fromOnly <$> DB.query conn
-		"with recursive finishable(state) as (\
-			\values (?) \
-			\union \
-			\select f_state as state \
-			\from segment \
-			\join finishable \
-			\on game = ? and t_state = finishable.state \
-		\) select state from finishable"
-		(pTarget p, pGame p)
+data Split = Split
+	{ run :: ID
+	, seqNo :: Int32
+	, state :: Text
+	, microsecond :: DiffTimeSpec
+	, frame :: Maybe Int32
+	} deriving (Eq, Ord, Read, Show)
+	-- BEWARE: some functions assume that the Ord instance compares on run
+	-- first, then seqNo, then other stuff
+
+instance DB.FromRow Split where
+	fromRow = pure Split
+		<*> DB.field
+		<*> DB.field
+		<*> DB.field
+		<*> DB.field
+		<*> DB.field
+
+allSplits :: Context -> Connection -> IO [Split]
+allSplits (ctxProfile -> p) conn = do
+	ids <- DB.query conn "select id from run where game = ?" (DB.Only (pGame p))
+	DB.query conn "select run, seq_no, state, microsecond, frame from split where run in ?"
+		. DB.Only
+		. DB.In
+		. map DB.fromOnly
+		$ (ids :: [DB.Only ID])
+
+data Segment = Segment
+	{ endState :: Text
+	, duration :: DiffTimeSpec
+	, frames :: Maybe Int32
+	} deriving (Eq, Ord, Read, Show)
+
+allSegments :: [Split] -> Map Text [Segment]
+allSegments = id
+	. M.fromListWith (++)
+	. concat
+	. ap (zipWith mkSegment) tail
+	. sort
 	where
-	p = ctxProfile ctx
+	mkSegment split split' =
+		[(state split, [Segment
+			{ endState = state split'
+			, duration = microsecond split' - microsecond split
+			, frames = liftA2 (-) (frame split') (frame split)
+			}])
+		| run split == run split' && seqNo split + 1 == seqNo split'
+		]
+
+finishableStates :: Context -> [Split] -> Set Text
+finishableStates (ctxProfile -> p) = id
+	. restrict
+	. dfs (pTarget p)
+	. M.fromListWith (++)
+	. concat
+	. ap (zipWith predecessor) tail
+	. sort
+	where
 	restrict ss = case soAllStates (pSortOrder p) of
 		-- paranoia: what if there are two profiles with the same game name?
 		-- (but not quite paranoid enough to deal with two profiles
@@ -1122,6 +1170,15 @@ finishableStates ctx conn
 		-- you finally have to give in to GIGO)
 		Just ss' -> S.intersection (O.toSet ss') ss
 		Nothing -> ss
+
+	predecessor s s' =
+		[(state s', [state s]) | run s == run s' && seqNo s + 1 == seqNo s']
+
+dfs :: Ord a => a -> Map a [a] -> Set a
+dfs root neighbors = go root (S.singleton root) where
+	go s seen = case M.lookup s neighbors of
+		Nothing -> seen
+		Just (S.fromList -> ss) -> foldr go (ss `S.union` seen) (ss S.\\ seen)
 
 -- This produces the expected (in the statistics sense of the term) run time
 -- from all source states that can reach the target to the target. The model
@@ -1157,23 +1214,16 @@ finishableStates ctx conn
 -- estimate these expectations by solving the system of linear equations.
 expectedRunTimes :: Context -> Connection -> IO (Map Text DiffTimeSpec)
 expectedRunTimes ctx conn = do
-	ss <- finishableStates ctx conn
-	let target = pTarget (ctxProfile ctx)
+	splits <- allSplits ctx conn
+	let ss = finishableStates ctx splits
+	    target = pTarget (ctxProfile ctx)
 	    nonTargets = S.delete target ss
-	stats_ <- DB.query conn
-		"select f_state, t_state, count(*), sum(t_microsecond - f_microsecond) \
-		\from segment \
-		\where f_state in ? and t_state in ? and game = ? \
-		\group by f_state, t_state"
-		(DB.In . S.toList $ nonTargets, DB.In . S.toList $ ss, pGame (ctxProfile ctx))
-	maps <- for stats_ $ \row@(from, to, n, dur) -> do
-		pure
-			. M.singleton from
-			. M.singleton to
-			$ ( fromIntegral (n :: Int64)
-			  , fromRational dur / 1000000
-			  )
-	let stats = M.unionsWith (M.unionWith pointwiseAddition) maps
+	    stats = summarize <$> allSegments splits
+	    -- this does all the addition in the world of exact integers, then at
+	    -- the last second converts to Double; this avoids rounding issues to
+	    -- the extent possible (at the unlikely cost of overflow issues)
+	    summarize segs = (\(n, dur) -> (n, realToFrac dur)) <$> M.fromListWith pointwiseAddition
+	    	[(endState seg, (1, duration seg)) | seg <- segs]
 	    pointwiseAddition (n, dur) (n', dur') = (n+n', dur+dur')
 	    outEdgeCounts = sum . fmap fst <$> stats
 	    nonTargetsList = S.toList nonTargets
@@ -1194,8 +1244,8 @@ expectedRunTimes ctx conn = do
 	    	      outEdgeCount = max 1 (M.findWithDefault 1 from outEdgeCounts)
 	    	]
 	when (M.keysSet stats /= nonTargets) . writeChan (ctxErrors ctx) $ printf
-		"Some finishable states didn't have any edges to other finishable states or something? Weird. (nonTargets, maps) = %s"
-		(show (nonTargets, maps))
+		"Some finishable states didn't have any edges to other finishable states or something? Weird. (nonTargets, stats) = %s"
+		(show (nonTargets, stats))
 	let expectedTimes = (Matrix.ident (S.size nonTargets) - transitionMatrix) Matrix.<\> edgeTimes
 	pure
 		. M.insert target 0
@@ -1224,57 +1274,17 @@ expectedModule = synchronousOnlyModule "expected" initialize handleEvent where
 				Nothing -> []
 				Just dt -> [Time (addTimeSpec dt (eTime e))]
 
-newtype HetRow = HetRow ([DB.Action] -> [DB.Action])
-
-hetField :: DB.ToField a => a -> HetRow
-hetField a = HetRow (DB.toField a:)
-
-hetRow :: DB.ToRow a => a -> HetRow
-hetRow a = HetRow (DB.toRow a ++)
-
-instance DB.ToRow HetRow where
-	toRow (HetRow f) = f []
-
-instance Semigroup HetRow where HetRow f <> HetRow g = HetRow (f . g)
-instance Monoid HetRow where mempty = HetRow id
-
-randomNextStates ::
-	Context -> Connection ->
-	[Text] -> Map Int Text -> IO (Map Int (Text, DiffTimeSpec))
-randomNextStates ctx conn finishable states = do
-	toMap <$> DB.query conn nextStateQuery (currentStates DB.:. otherParameters)
-	where
-	toMap results = M.fromList [(n, (s, dur)) | (n, s, dur) <- results]
-	currentStates = M.foldMapWithKey (\i s -> hetRow (i, s)) states
-	game = pGame (ctxProfile ctx)
-	otherParameters = (game, DB.In finishable, game, DB.In finishable)
-	nextStateQuery = fromString $ ""
-		-- using this with/as construction prevents the random column from
-		-- being re-randomized many times as the query executes
-		++ "with indexed_source as\
-		    	\(\
-		    	\select id, state, floor(1+max_index*random()) as index \
-		    	\from (values"
-		++ intercalate "," (replicate (M.size states) "(?, ?)")
-		++  	") as source (id, state) \
-		    	\join\
-		    	\( \
-		    		\select f_state, count(*) as max_index \
-		    		\from segment \
-		    		\where game = ? and t_state in ? \
-		    		\group by f_state\
-		    	\) as state_count \
-		    	\on source.state = state_count.f_state\
-		    	\)\
-		    \select id, t_state, duration from\
-		    	\(\
-		    		\select f_state, t_state, duration, row_number() over (partition by f_state) as index \
-		    		\from segment \
-		    		\where game = ? and t_state in ?\
-		    	\) as indexed_segment \
-		    	\join \
-		    	\indexed_source \
-		    	\on indexed_segment.f_state = indexed_source.state and indexed_segment.index = indexed_source.index"
+randomRun :: Map Text [Segment] -> Text -> Text -> IO [(Text, DiffTimeSpec)]
+randomRun segMap_ tgt = go 0 [] where
+	segMap = V.fromList <$> segMap_
+	go t prev s
+		| s == tgt = pure prev'
+		| otherwise = case M.lookup s segMap of
+			Just segs -> do
+				seg <- (segs V.!) <$> randomRIO (0, V.length segs - 1)
+				go (t+duration seg) prev' (endState seg)
+			Nothing -> pure prev'
+		where prev' = (s,t):prev
 
 -- TODO: make this configurable
 allModules :: [Module]
