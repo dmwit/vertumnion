@@ -1431,9 +1431,66 @@ addRun ((_, t):es) runs = M.S.unionWith MS.union newRuns runs where
 	newRuns = M.fromListWith const
 		[(state, MS.singleton (t-t')) | (state, t') <- es]
 
+percentileModule :: Double -> Module
+percentileModule p_ = Module (pString ++ " percentile") $ \ctx i_ o -> do
+	(epoch, _) <- readTVarIO (ctxRandomRuns ctx)
+
+	i <- newChan
+	forkIO . forever $ readChan i_ >>= writeChan i . Right
+	forkIO $ awaitEpochChanges (ctxRandomRuns ctx) i epoch
+
+	waiting ctx i o
+	where
+	p = min 1 (max 0 p_)
+
+	pString = if fromIntegral pBigInt == pBig
+		then show pBigInt ++ ordinalSuffix pBigInt
+		else show pBig ++ "th"
+		where
+		pBig = 100*p
+		pBigInt = round pBig
+	ordinalSuffix 1 = "st"
+	ordinalSuffix 2 = "nd"
+	ordinalSuffix 3 = "rd"
+	ordinalSuffix _ = "th"
+
+	awaitEpochChanges i_ i epoch = do
+		(epoch', runs) <- atomically $ do
+			v@(epoch', runs) <- readTVar i_
+			when (epoch == epoch') retry
+			pure v
+		writeChan i (Left runs)
+		awaitEpochChanges i_ i epoch'
+
+	waiting ctx i o = do
+		modification <- readChan i
+		case modification of
+			Left{} -> waiting ctx i o
+			Right Stop{} -> waiting ctx i o
+			Right (StateChange e) -> running ctx i o M.empty [e]
+
+	running ctx i o runs events = do
+		modification <- readChan i
+		case modification of
+			Left runs' -> redraw ctx i o runs' events
+			Right (StateChange event) -> redraw ctx i o runs (event:events)
+			Right Stop{} -> waiting ctx i o
+
+	redraw ctx i o runs events = do
+		length pts `seq` atomically (writeTVar o pts)
+		updateGraph ctx
+		running ctx i o runs events
+		where
+		pts =
+			[ ModulePoint (eTime e) (Time (addTimeSpec dt (eTime e)))
+			| e <- events
+			, Just dts <- [M.lookup (eState e) runs]
+			, Just dt <- [dts MS.!? round (p * fromIntegral (MS.size dts - 1))]
+			]
+
 -- TODO: make this configurable
 allModules :: [Module]
-allModules = [eventProgressModule, timeProgressModule, expectedModule, pbModule, currentPointModule]
+allModules = [eventProgressModule, timeProgressModule, percentileModule 0.1, percentileModule 0.9, expectedModule, pbModule, currentPointModule]
 
 moduleThread :: Context -> IO loop
 moduleThread ctx = do
