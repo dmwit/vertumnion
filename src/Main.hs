@@ -1423,7 +1423,7 @@ randomRun segMap_ tgt = go 0 [] where
 
 addRun :: [(Text, DiffTimeSpec)] -> Runs -> Runs
 addRun [] runs = runs
-addRun ((_, t):es) runs = M.S.unionWith MS.union newRuns runs where
+addRun es@((_, t):_) runs = M.S.unionWith MS.union newRuns runs where
 	-- const keeps the last (earliest) one in the list if we hit a given state
 	-- multiple times. If we were paranoid, we could use max instead. We don't
 	-- want to keep them both because they are correlated -- and so not IID
