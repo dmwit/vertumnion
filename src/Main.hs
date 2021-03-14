@@ -34,6 +34,7 @@ import Data.List
 import Data.Map (Map)
 import Data.Maybe
 import Data.Monoid
+import Data.Multiset (Multiset)
 import Data.Ord
 import Data.Set (Set)
 import Data.Set.Ordered (OSet)
@@ -65,6 +66,8 @@ import qualified Config.Schema as C
 import qualified Config.Macro as C
 import qualified Data.ByteString as BS
 import qualified Data.Map as M
+import qualified Data.Map.Strict as M.S
+import qualified Data.Multiset as MS
 import qualified Data.Set as S
 import qualified Data.Set.Ordered as O
 import qualified Data.Text as T
@@ -103,6 +106,8 @@ data Context = Context
 	, ctxTimeMagnitude :: IORef TimeMagnitude
 	, ctxEventStore :: TreeStore Event
 	, ctxStateRange :: TVar StateRange
+	-- the Word is an epoch, used as an equality-check fast path
+	, ctxRandomRuns :: TVar (Word, Runs)
 	}
 
 initializeContext :: IO Context
@@ -127,6 +132,7 @@ initializeContext = do
 		, srMin = pTarget profile
 		, srMax = pTarget profile
 		}
+	randomRuns <- newTVarIO (0, M.empty)
 	pure Context
 		{ ctxConfig = config
 		, ctxProfile = profile
@@ -140,6 +146,7 @@ initializeContext = do
 		, ctxTimeMagnitude = timeMagnitude
 		, ctxEventStore = eventStore
 		, ctxStateRange = stateRange
+		, ctxRandomRuns = randomRuns
 		}
 
 data Config = Config
@@ -1366,6 +1373,42 @@ expectedModule = synchronousOnlyModule "expected" initialize handleEvent where
 				Nothing -> []
 				Just dt -> [Time (addTimeSpec dt (eTime e))]
 
+type Runs = Map Text (Multiset DiffTimeSpec)
+
+runGenerationThread :: Context -> Chan Command -> IO loop
+runGenerationThread ctx cmds = do
+	conn <- DB.connectPostgreSQL (db (ctxConfig ctx))
+	waiting conn
+	where
+	runTVar = ctxRandomRuns ctx
+	target = pTarget (ctxProfile ctx)
+	maxRunCount = 1000 -- TODO: configurable
+
+	waiting conn = do
+		cmd <- readChan cmds
+		case cmd of
+			Stop{} -> waiting conn
+			StateChange e -> do
+				atomically $ modifyTVar runTVar (\(epoch, _) -> (epoch+1, M.empty))
+				segs <- finishableSegments ctx <$> allSplits ctx conn
+				generating conn segs (eState e)
+
+	generating conn segs state = do
+		(_, runs) <- readTVarIO runTVar
+		let remainingRunCount = maxRunCount - if state `M.member` segs
+		    	then fromIntegral (MS.size (M.findWithDefault MS.empty state runs))
+		    	else maxRunCount
+		replicateM_ remainingRunCount $ do
+			events <- randomRun segs target state
+			case events of
+				(s,_):_ | s == target -> atomically . modifyTVar' runTVar $
+					\(epoch, runs) -> (,) (epoch+1) $! addRun events runs
+				_ -> pure ()
+		cmd <- readChan cmds
+		case cmd of
+			Stop{} -> waiting conn
+			StateChange e -> generating conn segs (eState e)
+
 randomRun :: Map Text [Segment] -> Text -> Text -> IO [(Text, DiffTimeSpec)]
 randomRun segMap_ tgt = go 0 [] where
 	segMap = V.fromList <$> segMap_
@@ -1377,6 +1420,16 @@ randomRun segMap_ tgt = go 0 [] where
 				go (t+duration seg) prev' (endState seg)
 			Nothing -> pure prev'
 		where prev' = (s,t):prev
+
+addRun :: [(Text, DiffTimeSpec)] -> Runs -> Runs
+addRun [] runs = runs
+addRun ((_, t):es) runs = M.S.unionWith MS.union newRuns runs where
+	-- const keeps the last (earliest) one in the list if we hit a given state
+	-- multiple times. If we were paranoid, we could use max instead. We don't
+	-- want to keep them both because they are correlated -- and so not IID
+	-- samples.
+	newRuns = M.fromListWith const
+		[(state, MS.singleton (t-t')) | (state, t') <- es]
 
 -- TODO: make this configurable
 allModules :: [Module]
@@ -1390,6 +1443,10 @@ moduleThread ctx = do
 		forkIO (() <$ mLaunch m ctx chan tvar)
 		pure (chan, (mLabel m, tvar))
 	atomically $ writeTVar (ctxModuleOutputs ctx) outs
+	-- TODO: when modules are configurable, only launch this thread when it's
+	-- needed
+	chan <- newChan
+	forkIO (runGenerationThread ctx chan)
 	forever $ do
 		mEvent <- readChan (ctxModuleInput ctx)
-		for_ chans $ \chan -> writeChan chan mEvent
+		for_ (chan:chans) $ \chan -> writeChan chan mEvent
