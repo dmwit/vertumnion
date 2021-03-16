@@ -522,6 +522,7 @@ renderGraph ctx = do
 		Cairo.stroke
 
 	when hasState $ do
+		-- TODO: we should also check that we have enough height
 		maxWidth <- fmap (maximum . (0:)) . forM (M.keys states) $ \state -> if isMajor state
 			then Cairo.textExtentsXadvance <$> Cairo.textExtents state
 			else pure 0
