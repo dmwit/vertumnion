@@ -84,6 +84,7 @@ import qualified Database.PostgreSQL.Simple.FromRow as DB
 import qualified Database.PostgreSQL.Simple.ToRow as DB
 import qualified Database.PostgreSQL.Simple.Types as DB
 import qualified Graphics.Rendering.Cairo as Cairo
+import qualified Graphics.Rendering.Cairo.Matrix as CM
 import qualified Numeric.LinearAlgebra as Matrix
 import qualified Text.PrettyPrint.ANSI.Leijen as Doc
 
@@ -461,9 +462,11 @@ addColumnPlainText treeView model showRow = do
 renderGraph :: Context -> Render ()
 renderGraph ctx = do
 	(_, _, w, h) <- Cairo.clipExtents
-	if w < h
-		then Cairo.translate 0 ((h-w)/2) >> Cairo.scale w w
-		else Cairo.translate ((w-h)/2) 0 >> Cairo.scale h h
+	let wScale = w/1.5
+	    hScale = h/1.3
+	if wScale < hScale
+		then Cairo.scale wScale wScale >> Cairo.translate 0.4 (h/(2*wScale)-0.55)
+		else Cairo.scale hScale hScale >> Cairo.translate (w/(2*hScale)-0.35) 0.1
 	states_ <- liftIO (ctxStates ctx)
 	ptss_ <- liftIO $ readTVarIO (ctxModuleOutputs ctx)
 	ptss <- liftIO $ for ptss_ $ \(label, ptVar) -> (,) label <$> readTVarIO ptVar
@@ -525,12 +528,31 @@ renderGraph ctx = do
 			Cairo.lineTo 1 (1 - ix / maxStateIx)
 		Cairo.stroke
 	when hasLogScale $ do
+		-- draw grid lines
 		Cairo.setDash [1/60, 5/60] (-5/120)
 		for_ (lsbGridLines lsb) $ \n -> do
 			let coord = yPos (LogScale n)
 			Cairo.moveTo 0 coord
 			Cairo.lineTo 1 coord
 		Cairo.stroke
+
+		-- label grid lines
+		lsbInfo <- traverse logScaleRenderingInformation (lsbGridLines lsb)
+		let maxPreWidth = maximum (map lsriPrefixWidth lsbInfo)
+		    maxSufWidth = maximum (map lsriSuffixWidth lsbInfo)
+		    lsWidth = maxPreWidth + maxSufWidth
+		    scale = 0.1/lsWidth
+		    sepX = maxPreWidth*scale - 0.4
+		scaleFontMatrix scale
+		fe <- Cairo.fontExtents
+		let dy = (Cairo.fontExtentsAscent fe - Cairo.fontExtentsDescent fe) / 2
+		forM_ lsbInfo $ \i -> do
+			let y = yPos (LogScale (lsriValue i)) + dy
+			    sepWidth = (Cairo.textExtentsXadvance . stExtents . lsriSeparator) i * scale
+			Cairo.moveTo (sepX - lsriPrefixWidth i * scale) y
+			Cairo.showText (lsriPrefixString i ++ lsriSeparatorString i)
+			Cairo.moveTo (sepX + sepWidth / 2) y
+			Cairo.showText (lsriSuffixString i)
 
 	for_ (zip [0..] ptss) $ \(i, (lbl, pts)) -> do
 		let dAngle = min (pi / numModules) (pi / 12)
@@ -543,6 +565,11 @@ renderGraph ctx = do
 			Cairo.moveTo xCoord yCoord
 			Cairo.arc xCoord yCoord 0.03 (angle-dAngle) (angle+dAngle)
 		Cairo.fill
+
+	Cairo.setSourceRGB 0 0 0
+
+scaleFontMatrix :: Double -> Render ()
+scaleFontMatrix s = Cairo.setFontMatrix . CM.scalarMultiply s =<< Cairo.getFontMatrix
 
 data TimeBounds = TimeBounds
 	{ tbZero :: TimeSpec
@@ -643,9 +670,6 @@ chooseLogScaleBounds ns
 			]
 		gridLines = chooseAFewEvenly allGrids
 
-logScalePos :: LogScaleBounds -> Double -> Double
-logScalePos lsb n = lsbOffset lsb + log (n/lsbZero lsb) * lsbScale lsb
-
 chooseAFewEvenly :: [a] -> [a]
 chooseAFewEvenly as
 	| lines <= 6 = as
@@ -676,6 +700,87 @@ chooseAFewEvenly as
 
 roundDigits :: Set Double
 roundDigits = S.fromList [1, 2, 5]
+
+logScalePos :: LogScaleBounds -> Double -> Double
+logScalePos lsb n = lsbOffset lsb + log (n/lsbZero lsb) * lsbScale lsb
+
+logScaleShow :: Double -> (String, String, String)
+logScaleShow = id
+	. snd
+	. head
+	. sortOn (\(penalty, (pre, mid, suf)) -> (penalty + length (pre++mid++suf), mid))
+	-- penalty: non-scientific notation is a bit nicer when it's possible, even
+	-- to the point that we might want to choose it even when it's longer
+	. (\v -> [(0, showDigitsFlat v), (1, showDigitsScientific v)])
+	. dropZeros
+	. sigFigs
+
+sigFigs :: Double -> (Int, Int)
+sigFigs 0 = (0, 0)
+sigFigs n = (round (n/scale), magnitude) where
+	-- 0.01 is a fudge factor for slightly-too-low log calculations
+	magnitude = floor (logBase 10 (abs n) + 0.01) - 2
+	scale = 10^^magnitude
+
+dropZeros :: (Int, Int) -> (Int, Int)
+dropZeros v@(mantissa, exponent) = case mantissa `quotRem` 10 of
+	(0, 0) -> v
+	(mantissa', 0) -> dropZeros (mantissa', exponent+1)
+	_ -> v
+
+showDigitsFlat :: (Int, Int) -> (String, String, String)
+showDigitsFlat (mantissa, exponent)
+	| exponent >= 0 = (show mantissa ++ replicate exponent '0', "", "")
+	| otherwise = go mantissa exponent ""
+	where
+	go 0 e suf = (['-' | mantissa < 0] ++ "0", ".", replicate (-e) '0' ++ suf) -- fast path
+	go m 0 suf = (show m, ".", suf)
+	go m e suf = let (q, r) = m `quotRem` 10 in go q (e+1) (intToDigit (abs r) : suf)
+
+showDigitsScientific :: (Int, Int) -> (String, String, String)
+showDigitsScientific (mantissa, exponent) = go mantissa exponent "" where
+	go m e suf
+		| abs m < 10 = (show m ++ ['.' | not (null suf)] ++ suf, "e", show e)
+		| otherwise = let (q, r) = m `quotRem` 10 in go q (e+1) (intToDigit (abs r) : suf)
+
+data SizedText = SizedText
+	{ stString :: String
+	, stExtents :: Cairo.TextExtents
+	}
+
+sizedText :: String -> Render SizedText
+sizedText s = SizedText s <$> Cairo.textExtents s
+
+data LogScaleRenderingInformation = LSRI
+	{ lsriValue :: Double
+	, lsriPrefix :: SizedText
+	, lsriSeparator :: SizedText
+	, lsriSuffix :: SizedText
+	, lsriPrefixWidth :: Double
+	, lsriSuffixWidth :: Double
+	}
+
+logScaleRenderingInformation :: Double -> Render LogScaleRenderingInformation
+logScaleRenderingInformation n = do
+	pre <- sizedText pre_
+	sep <- sizedText sep_
+	suf <- sizedText suf_
+	pure LSRI
+		{ lsriValue = n
+		, lsriPrefix = pre
+		, lsriSeparator = sep
+		, lsriSuffix = suf
+		, lsriPrefixWidth = dx pre + dx sep / 2
+		, lsriSuffixWidth = dx suf + dx sep / 2
+		}
+	where
+	(pre_, sep_, suf_) = logScaleShow n
+	dx = Cairo.textExtentsXadvance . stExtents
+
+lsriPrefixString, lsriSeparatorString, lsriSuffixString :: LogScaleRenderingInformation -> String
+lsriPrefixString = stString . lsriPrefix
+lsriSeparatorString = stString . lsriSeparator
+lsriSuffixString = stString . lsriSuffix
 
 -- | The 'Word8' is how many digits there are.
 data TimeMagnitude = Seconds | Minutes | Hours | Days Word8 deriving (Eq, Ord, Read, Show)
