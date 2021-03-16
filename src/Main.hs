@@ -509,17 +509,16 @@ renderGraph ctx = do
 
 	Cairo.setLineWidth 0.001
 	when hasTime $ do
+		for_ [0, tbGridLine tb .. tbMax tb] $ \d -> do
+			let coord = coordDiffPos d
+			Cairo.moveTo coord 0
+			Cairo.lineTo coord 1
+		Cairo.stroke
 		Cairo.setDash [1/60, 1/60] (1/120)
 		for_ [0, tbGridLine tb .. tbMax tb] $ \d -> do
 			let coord = coordDiffPos d
 			Cairo.moveTo 0 coord
 			Cairo.lineTo 1 coord
-		Cairo.stroke
-		Cairo.setDash [] 0
-		for_ [0, tbGridLine tb .. tbMax tb] $ \d -> do
-			let coord = coordDiffPos d
-			Cairo.moveTo coord 0
-			Cairo.lineTo coord 1
 		Cairo.stroke
 	when hasState $ do
 		Cairo.setDash [1/60, 3/60, 1/60, 1/60] (-1/120)
