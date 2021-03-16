@@ -520,12 +520,25 @@ renderGraph ctx = do
 			Cairo.moveTo 0 coord
 			Cairo.lineTo 1 coord
 		Cairo.stroke
+
 	when hasState $ do
+		maxWidth <- fmap (maximum . (0:)) . forM (M.keys states) $ \state -> if isMajor state
+			then Cairo.textExtentsXadvance <$> Cairo.textExtents state
+			else pure 0
+		scaleFontMatrix (0.1/maxWidth)
+
+		fe <- Cairo.fontExtents
+		let dy = (Cairo.fontExtentsAscent fe - Cairo.fontExtentsDescent fe) / 2
+
 		Cairo.setDash [1/60, 3/60, 1/60, 1/60] (-1/120)
 		flip M.traverseWithKey states $ \state ix -> when (isMajor state) $ do
-			Cairo.moveTo 0 (1 - ix / maxStateIx)
-			Cairo.lineTo 1 (1 - ix / maxStateIx)
+			let y = 1 - ix / maxStateIx
+			Cairo.moveTo 0 y
+			Cairo.lineTo 1 y
+			Cairo.moveTo (-0.2) (y+dy)
+			Cairo.showText state
 		Cairo.stroke
+
 	when hasLogScale $ do
 		-- draw grid lines
 		Cairo.setDash [1/60, 5/60] (-5/120)
