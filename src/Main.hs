@@ -509,21 +509,31 @@ renderGraph ctx = do
 
 	Cairo.setLineWidth 0.001
 	when hasTime $ do
+		labels <- traverse (sizedText . tbLabel tb) [0, tbGridLine tb .. tbMax tb]
+		let maxWidth = maximum (-1:map (Cairo.textExtentsXadvance . stExtents) labels)
+		    scale = 0.1/maxWidth
+		scaleFontMatrix scale
+		fe <- Cairo.fontExtents
+		let dy = (Cairo.fontExtentsAscent fe - Cairo.fontExtentsDescent fe) / 2
+
 		for_ [0, tbGridLine tb .. tbMax tb] $ \d -> do
-			let coord = coordDiffPos d
+			let coord = 1 - coordDiffPos d
 			Cairo.moveTo coord 0
 			Cairo.lineTo coord 1
 		Cairo.stroke
 		Cairo.setDash [1/60, 1/60] (1/120)
-		for_ [0, tbGridLine tb .. tbMax tb] $ \d -> do
-			let coord = coordDiffPos d
+		for_ (zip labels [0, tbGridLine tb .. tbMax tb]) $ \(st, d) -> do
+			let coord = 1 - coordDiffPos d
+			    dx = Cairo.textExtentsXadvance (stExtents st) * scale
 			Cairo.moveTo 0 coord
 			Cairo.lineTo 1 coord
+			Cairo.moveTo (-0.2 - dx) (coord + dy)
+			Cairo.showText (stString st)
 		Cairo.stroke
 
 	when hasState $ do
 		-- TODO: we should also check that we have enough height
-		maxWidth <- fmap (maximum . (0:)) . forM (M.keys states) $ \state -> if isMajor state
+		maxWidth <- fmap (maximum . (-1:)) . forM (M.keys states) $ \state -> if isMajor state
 			then Cairo.textExtentsXadvance <$> Cairo.textExtents state
 			else pure 0
 		scaleFontMatrix (0.1/maxWidth)
@@ -588,26 +598,32 @@ data TimeBounds = TimeBounds
 	{ tbZero :: TimeSpec
 	, tbGridLine :: DiffTimeSpec
 	, tbMax :: DiffTimeSpec
-	} deriving (Eq, Ord, Read, Show)
+	, tbLabel :: DiffTimeSpec -> String
+	}
 
 chooseTimeBounds :: [TimeSpec] -> TimeBounds
 chooseTimeBounds [] = TimeBounds
 	{ tbZero = arbitraryTimeSpec
 	, tbGridLine = 1
 	, tbMax = 10
+	, tbLabel = \t -> show (floor t) ++ "s"
 	}
 chooseTimeBounds ts = TimeBounds
 	{ tbZero = zero
 	, tbGridLine = grid
 	, tbMax = bigAndRound
+	, tbLabel = label
 	} where
 	zero = minimum ts
 	big = maximum ts
 	bigDiff = diffTimeSpec big zero
 	gridTarget = bigDiff / 10
-	grid = case S.lookupGE gridTarget roundIntervals of
+	(grid, label) = case M.lookupGE gridTarget roundIntervals of
 		Just v -> v
-		Nothing -> gridDays (60*60*24) (gridTarget / (60*60*24))
+		Nothing -> ( gridDays (60*60*24) (gridTarget / (60*60*24))
+		           , \t -> let (pre, sep, suf) = logScaleShow . fromInteger . floor $ t/(60*60*24)
+		                   in concat [pre, sep, suf, "d"]
+		           )
 	gridDays cur tgt
 		| tgt > 5 = gridDays (cur*10) (tgt/10)
 		| tgt > 2 = cur*5
@@ -615,12 +631,22 @@ chooseTimeBounds ts = TimeBounds
 		| otherwise = cur
 	bigAndRound = fromInteger (ceiling (bigDiff / grid)) * grid
 
-roundIntervals :: Set DiffTimeSpec
-roundIntervals = S.fromList
+roundIntervals :: Map DiffTimeSpec (DiffTimeSpec -> String)
+roundIntervals = M.fromList $ zip
 	[      1,       2,       5,       10,       30 -- seconds
 	,   60*1,    60*2,    60*5,    60*10,    60*30 -- minutes
 	,60*60*1, 60*60*2, 60*60*6, 60*60*12           -- hours
 	]
+	([]
+	++ replicate 5 (fmt "%m:%02S")
+	++ replicate 5 (\t -> fmt (if t < 60*60 then "%-mm" else "%-hh%02Mm") t)
+	++ replicate 4 (\t -> fmt (if t < 60*60*24 then "%-hh" else "%-dd%02Hh") t)
+	)
+	where
+	fmt format = formatTime defaultTimeLocale format . ndt
+
+	ndt :: DiffTimeSpec -> NominalDiffTime
+	ndt = realToFrac
 
 timePos :: TimeBounds -> TimeSpec -> Double
 timePos tb t = diffTimePos tb (diffTimeSpec t (tbZero tb))
