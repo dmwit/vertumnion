@@ -388,6 +388,7 @@ guiThread ctx = do
 	updateTimerLabel ctx
 
 	eventLog <- treeViewNewWithModel (ctxEventStore ctx)
+	set eventLog [treeViewHeadersVisible := False]
 	let newColumn :: GlibString string => (Event -> IO string) -> IO Int
 	    newColumn = addColumnPlainText eventLog (ctxEventStore ctx)
 	newColumn (pure . eState)
@@ -434,9 +435,14 @@ guiThread ctx = do
 	widgetSetSizeRequest (ctxUIGraph ctx) 200 200
 	on (ctxUIGraph ctx) draw (renderGraph ctx)
 
+	legend <- mkLegend
+	graphPane <- hPanedNew
+	panedPack1 graphPane (ctxUIGraph ctx) True True
+	panedPack2 graphPane legend False True
+
 	dataPane <- vPanedNew
 	panedPack1 dataPane eventLogScroll True True
-	panedPack2 dataPane (ctxUIGraph ctx) False True
+	panedPack2 dataPane graphPane False True
 
 	boxPackStart vbox gameLabel PackNatural 0
 	boxPackStart vbox targetLabel PackNatural 0
@@ -458,6 +464,49 @@ addColumnPlainText treeView model showRow = do
 	treeViewColumnPackEnd col renderer False
 	cellLayoutSetAttributes col renderer model $ \row -> [cellText :=> showRow row]
 	treeViewAppendColumn treeView col
+
+mkLegend :: IO TreeView
+mkLegend = do
+	store <- listStoreNew $ []
+		++ map Left (zip [0..] allModules)
+		++ map Right [("time", [1, 1], 1/2), ("state", [1,3,1,1], -1/2), ("number", [1,5], -5/2)]
+	treeView <- treeViewNewWithModel store
+	col <- treeViewColumnNew
+	graphicRenderer <- cellRendererPixbufNew
+	labelRenderer <- cellRendererTextNew
+	treeViewColumnPackStart col graphicRenderer False
+	treeViewColumnPackStart col labelRenderer True
+	cellLayoutSetAttributes col graphicRenderer store $ \row -> [cellPixbuf :=> legendPixbuf row]
+	cellLayoutSetAttributes col labelRenderer store $ \row -> [cellText := legendText row]
+	treeViewAppendColumn treeView col
+	set treeView [treeViewHeadersVisible := False]
+	pure treeView
+
+legendText :: Either (Double, Module) (String, [Double], Double) -> String
+legendText (Left (_, m)) = mLabel m
+legendText (Right (s, _, _)) = s
+
+legendPixbuf :: Either (Double, Module) (String, [Double], Double) -> IO Pixbuf
+legendPixbuf row = do
+	surface <- Cairo.createImageSurface Cairo.FormatARGB32 30 30
+	Cairo.renderWith surface $ case row of
+		Left (i, _) -> do
+			let dAngle = min (pi / numModules) (pi / 12)
+			    angle = 2 * pi * i / numModules
+			    RGB r g b = toSRGB (cieLAB d65 50 (100 * cos angle) (100 * sin angle))
+			Cairo.setSourceRGB r g b
+			Cairo.moveTo 15 15
+			Cairo.arc 15 15 14 (angle-dAngle) (angle+dAngle)
+			Cairo.fill
+		Right (_, intervals, start) -> do
+			Cairo.scale 5 5
+			Cairo.setLineWidth 0.4
+			Cairo.setDash intervals start
+			Cairo.moveTo 0 3
+			Cairo.lineTo 6 3
+			Cairo.stroke
+	pixbufNewFromSurface surface 0 0 30 30
+	where numModules = fromIntegral (length allModules)
 
 renderGraph :: Context -> Render ()
 renderGraph ctx = do
