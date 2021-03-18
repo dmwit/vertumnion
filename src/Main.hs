@@ -569,6 +569,7 @@ renderGraph ctx = do
 			let coord = 1 - coordDiffPos d
 			Cairo.moveTo coord 0
 			Cairo.lineTo coord 1
+			-- TODO: showText
 		Cairo.stroke
 		Cairo.setDash [1/60, 1/60] (1/120)
 		for_ (zip labels [0, tbGridLine tb .. tbMax tb]) $ \(st, d) -> do
