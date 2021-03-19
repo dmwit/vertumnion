@@ -223,7 +223,7 @@ profileSpec = C.sectionsSpec "profile" $ pure Profile
 	<*> C.reqSection' "game" textSpec "Which game you are playing (will be used as database key)"
 	<*> defaultableSection "fps" "variable" C.anySpec "The typical framerate of the game"
 	<*> C.reqSection' "target" textSpec "The winning state for this game, to stop the timer at"
-	<*> defaultableSection "major" "all" statesSpec "A list of major states that you want to be given special status in the UI. As a rule of thumb, pick the states that every run have to go through to win"
+	<*> defaultableSection "major" "all" statesSpec "A list of major states that you want to be given special status in the UI. As a rule of thumb, pick the states that every run has to go through to win"
 	<*> (fromMaybe Ascending <$> C.optSection' "order" orderSpec "When the UI must list states in order, what order shall it use? If you give a list of states, they will be put in exactly that order and other states will be discarded (default: ascending)")
 	<*> (fromMaybe Seconds <$> C.optSection' "duration" durationSpec "A hint about how long full runs typically take. If this is a number n, that means 10^n days (default: seconds)")
 	where
