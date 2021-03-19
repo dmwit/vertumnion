@@ -576,7 +576,26 @@ renderGraph ctx = do
 			[ (coordDiffPos t, (tbLabel tb t, "", ""))
 			| t <- [0, tbGridLine tb .. tbMax tb]
 			]
-		-- TODO: label x axis
+
+		spaceExtent <- Cairo.textExtents [' ']
+		fe <- Cairo.fontExtents
+		labels <- traverse sequence
+			[ (t, sizedText (tbLabel tb t))
+			| t <- [0, tbGridLine tb .. tbMax tb]
+			]
+
+		let maxWidth = maximum $ map (Cairo.textExtentsXadvance . stExtents . snd) labels
+		    xScale = 0.1/(Cairo.textExtentsXadvance spaceExtent + maxWidth)
+		    yScale = 0.1/(Cairo.fontExtentsAscent fe + Cairo.fontExtentsDescent fe)
+		    scale = min xScale yScale
+		    halfScale = scale/2
+		    y = 1.1 + (Cairo.fontExtentsAscent fe - Cairo.fontExtentsDescent fe) * halfScale
+
+		scaleFontMatrix scale
+		forM_ labels $ \(t, st) -> do
+			let dx = Cairo.textExtentsXadvance (stExtents st) * halfScale
+			Cairo.moveTo (1 - coordDiffPos t - dx) y
+			Cairo.showText (tbLabel tb t)
 
 	when hasState $ do
 		-- draw grid lines
@@ -641,8 +660,7 @@ valignText x w entries_ = do
 	    sepX = x + (w + (maxPreWidth - maxSufWidth)*scale)/2
 	    dy = (Cairo.fontExtentsAscent fe - Cairo.fontExtentsDescent fe)*scale/2
 
-	m <- Cairo.getFontMatrix
-	Cairo.setFontMatrix (CM.scalarMultiply scale m)
+	scaleFontMatrix scale
 
 	void . flip M.traverseWithKey entries $ \y_ vai -> do
 		let y = y_ + dy
@@ -651,6 +669,9 @@ valignText x w entries_ = do
 		Cairo.showText (stString (vaiPrefix vai) <> stString (vaiSeparator vai))
 		Cairo.moveTo (sepX + sepWidth/2) y
 		Cairo.showText (stString (vaiSuffix vai))
+
+scaleFontMatrix :: Double -> Render ()
+scaleFontMatrix s = Cairo.setFontMatrix . CM.scalarMultiply s =<< Cairo.getFontMatrix
 
 data SizedText string = SizedText
 	{ stString :: string
