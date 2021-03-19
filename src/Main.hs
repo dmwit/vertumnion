@@ -542,7 +542,7 @@ renderGraph ctx = do
 		xPos = timePos tb
 
 		coordDiffPos :: DiffTimeSpec -> Double
-		coordDiffPos = diffTimePos tb
+		coordDiffPos = (1-) . diffTimePos tb
 
 		yPos :: Dependent -> Double
 		yPos (State s) = 1 - (states M.! s) / maxStateIx
@@ -558,47 +558,41 @@ renderGraph ctx = do
 
 	Cairo.setLineWidth 0.001
 	when hasTime $ do
-		labels <- traverse (sizedText . tbLabel tb) [0, tbGridLine tb .. tbMax tb]
-		let maxWidth = maximum (-1:map (Cairo.textExtentsXadvance . stExtents) labels)
-		    scale = 0.1/maxWidth
-		scaleFontMatrix scale
-		fe <- Cairo.fontExtents
-		let dy = (Cairo.fontExtentsAscent fe - Cairo.fontExtentsDescent fe) / 2
-
+		-- draw grid lines
 		for_ [0, tbGridLine tb .. tbMax tb] $ \d -> do
-			let coord = 1 - coordDiffPos d
+			let coord = coordDiffPos d
 			Cairo.moveTo coord 0
 			Cairo.lineTo coord 1
-			-- TODO: showText
 		Cairo.stroke
 		Cairo.setDash [1/60, 1/60] (1/120)
-		for_ (zip labels [0, tbGridLine tb .. tbMax tb]) $ \(st, d) -> do
-			let coord = 1 - coordDiffPos d
-			    dx = Cairo.textExtentsXadvance (stExtents st) * scale
+		for_ [0, tbGridLine tb .. tbMax tb] $ \d -> do
+			let coord = coordDiffPos d
 			Cairo.moveTo 0 coord
 			Cairo.lineTo 1 coord
-			Cairo.moveTo (-0.2 - dx) (coord + dy)
-			Cairo.showText (stString st)
 		Cairo.stroke
 
+		-- label grid lines
+		valignText (-0.3) 0.1 . M.fromList $
+			[ (coordDiffPos t, (tbLabel tb t, "", ""))
+			| t <- [0, tbGridLine tb .. tbMax tb]
+			]
+		-- TODO: label x axis
+
 	when hasState $ do
-		-- TODO: we should also check that we have enough height
-		maxWidth <- fmap (maximum . (-1:)) . forM (M.keys states) $ \state -> if isMajor state
-			then Cairo.textExtentsXadvance <$> Cairo.textExtents state
-			else pure 0
-		scaleFontMatrix (0.1/maxWidth)
-
-		fe <- Cairo.fontExtents
-		let dy = (Cairo.fontExtentsAscent fe - Cairo.fontExtentsDescent fe) / 2
-
+		-- draw grid lines
 		Cairo.setDash [1/60, 3/60, 1/60, 1/60] (-1/120)
 		flip M.traverseWithKey states $ \state ix -> when (isMajor state) $ do
 			let y = 1 - ix / maxStateIx
 			Cairo.moveTo 0 y
 			Cairo.lineTo 1 y
-			Cairo.moveTo (-0.2) (y+dy)
-			Cairo.showText state
 		Cairo.stroke
+
+		-- label grid lines
+		valignText (-0.2) 0.1 . M.fromList $
+			[ (yPos (State state), ("", "", state))
+			| state <- M.keys states
+			, isMajor state
+			]
 
 	when hasLogScale $ do
 		-- draw grid lines
@@ -610,22 +604,10 @@ renderGraph ctx = do
 		Cairo.stroke
 
 		-- label grid lines
-		lsbInfo <- traverse logScaleRenderingInformation (lsbGridLines lsb)
-		let maxPreWidth = maximum (map lsriPrefixWidth lsbInfo)
-		    maxSufWidth = maximum (map lsriSuffixWidth lsbInfo)
-		    lsWidth = maxPreWidth + maxSufWidth
-		    scale = 0.1/lsWidth
-		    sepX = maxPreWidth*scale - 0.4
-		scaleFontMatrix scale
-		fe <- Cairo.fontExtents
-		let dy = (Cairo.fontExtentsAscent fe - Cairo.fontExtentsDescent fe) / 2
-		forM_ lsbInfo $ \i -> do
-			let y = yPos (LogScale (lsriValue i)) + dy
-			    sepWidth = (Cairo.textExtentsXadvance . stExtents . lsriSeparator) i * scale
-			Cairo.moveTo (sepX - lsriPrefixWidth i * scale) y
-			Cairo.showText (lsriPrefixString i ++ lsriSeparatorString i)
-			Cairo.moveTo (sepX + sepWidth / 2) y
-			Cairo.showText (lsriSuffixString i)
+		valignText (-0.4) 0.1 . M.fromList $
+			[ (yPos (LogScale gridLine), logScaleShow gridLine)
+			| gridLine <- lsbGridLines lsb
+			]
 
 	for_ (zip [0..] ptss) $ \(i, (lbl, pts)) -> do
 		let dAngle = min (pi / numModules) (pi / 12)
@@ -641,8 +623,70 @@ renderGraph ctx = do
 
 	Cairo.setSourceRGB 0 0 0
 
-scaleFontMatrix :: Double -> Render ()
-scaleFontMatrix s = Cairo.setFontMatrix . CM.scalarMultiply s =<< Cairo.getFontMatrix
+valignText :: (Cairo.CairoString string, IsString string, Monoid string) =>
+	Double -> Double -> Map Double (string, string, string) -> Render ()
+valignText x w entries_ = do
+	entries <- traverse valignInfo $
+		if M.null entries_
+		then M.singleton 0 ("", "", "")
+		else entries_
+	fe <- Cairo.fontExtents
+
+	let maxPreWidth = maximum (vaiPrefixWidth <$> entries)
+	    maxSufWidth = maximum (vaiSuffixWidth <$> entries)
+	    maxWidth = maxPreWidth + maxSufWidth
+	    xScale = w / maxWidth
+	    yScale = chooseYScale xScale fe entries
+	    scale = min xScale yScale
+	    sepX = x + (w + (maxPreWidth - maxSufWidth)*scale)/2
+	    dy = (Cairo.fontExtentsAscent fe - Cairo.fontExtentsDescent fe)*scale/2
+
+	m <- Cairo.getFontMatrix
+	Cairo.setFontMatrix (CM.scalarMultiply scale m)
+
+	void . flip M.traverseWithKey entries $ \y_ vai -> do
+		let y = y_ + dy
+		    sepWidth = scale * (Cairo.textExtentsXadvance . stExtents . vaiSeparator) vai
+		Cairo.moveTo (sepX - vaiPrefixWidth vai*scale) y
+		Cairo.showText (stString (vaiPrefix vai) <> stString (vaiSeparator vai))
+		Cairo.moveTo (sepX + sepWidth/2) y
+		Cairo.showText (stString (vaiSuffix vai))
+
+data SizedText string = SizedText
+	{ stString :: string
+	, stExtents :: Cairo.TextExtents
+	}
+
+sizedText :: Cairo.CairoString string => string -> Render (SizedText string)
+sizedText s = SizedText s <$> Cairo.textExtents s
+
+data VAlignInfo string = VAlignInfo
+	{ vaiPrefix, vaiSeparator, vaiSuffix :: SizedText string
+	, vaiPrefixWidth :: Double
+	, vaiSuffixWidth :: Double
+	}
+
+valignInfo :: Cairo.CairoString string => (string, string, string) -> Render (VAlignInfo string)
+valignInfo (pre_, sep_, suf_) = do
+	pre <- sizedText pre_
+	sep <- sizedText sep_
+	suf <- sizedText suf_
+	pure VAlignInfo
+		{ vaiPrefix = pre
+		, vaiSeparator = sep
+		, vaiSuffix = suf
+		, vaiPrefixWidth = dx pre + dx sep / 2
+		, vaiSuffixWidth = dx suf + dx sep / 2
+		}
+	where dx = Cairo.textExtentsXadvance . stExtents
+
+chooseYScale :: Double -> Cairo.FontExtents -> Map Double (VAlignInfo string) -> Double
+chooseYScale def fe vai
+	| M.size vai < 2 = def
+	| otherwise = minDY / reqDY
+	where
+	minDY = minimum . ap (zipWith subtract) tail . M.keys $ vai
+	reqDY = Cairo.fontExtentsHeight fe
 
 data TimeBounds = TimeBounds
 	{ tbZero :: TimeSpec
@@ -831,45 +875,6 @@ showDigitsScientific (mantissa, exponent) = go mantissa exponent "" where
 	go m e suf
 		| abs m < 10 = (show m ++ ['.' | not (null suf)] ++ suf, "e", show e)
 		| otherwise = let (q, r) = m `quotRem` 10 in go q (e+1) (intToDigit (abs r) : suf)
-
-data SizedText = SizedText
-	{ stString :: String
-	, stExtents :: Cairo.TextExtents
-	}
-
-sizedText :: String -> Render SizedText
-sizedText s = SizedText s <$> Cairo.textExtents s
-
-data LogScaleRenderingInformation = LSRI
-	{ lsriValue :: Double
-	, lsriPrefix :: SizedText
-	, lsriSeparator :: SizedText
-	, lsriSuffix :: SizedText
-	, lsriPrefixWidth :: Double
-	, lsriSuffixWidth :: Double
-	}
-
-logScaleRenderingInformation :: Double -> Render LogScaleRenderingInformation
-logScaleRenderingInformation n = do
-	pre <- sizedText pre_
-	sep <- sizedText sep_
-	suf <- sizedText suf_
-	pure LSRI
-		{ lsriValue = n
-		, lsriPrefix = pre
-		, lsriSeparator = sep
-		, lsriSuffix = suf
-		, lsriPrefixWidth = dx pre + dx sep / 2
-		, lsriSuffixWidth = dx suf + dx sep / 2
-		}
-	where
-	(pre_, sep_, suf_) = logScaleShow n
-	dx = Cairo.textExtentsXadvance . stExtents
-
-lsriPrefixString, lsriSeparatorString, lsriSuffixString :: LogScaleRenderingInformation -> String
-lsriPrefixString = stString . lsriPrefix
-lsriSeparatorString = stString . lsriSeparator
-lsriSuffixString = stString . lsriSuffix
 
 -- | The 'Word8' is how many digits there are.
 data TimeMagnitude = Seconds | Minutes | Hours | Days Word8 deriving (Eq, Ord, Read, Show)
