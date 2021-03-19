@@ -511,11 +511,11 @@ legendPixbuf row = do
 renderGraph :: Context -> Render ()
 renderGraph ctx = do
 	(_, _, w, h) <- Cairo.clipExtents
-	let wScale = w/1.5
+	let wScale = w/1.75
 	    hScale = h/1.3
 	if wScale < hScale
-		then Cairo.scale wScale wScale >> Cairo.translate 0.4 (h/(2*wScale)-0.55)
-		else Cairo.scale hScale hScale >> Cairo.translate (w/(2*hScale)-0.35) 0.1
+		then Cairo.scale wScale wScale >> Cairo.translate 0.45 (h/(2*wScale)-0.55)
+		else Cairo.scale hScale hScale >> Cairo.translate (w/(2*hScale)-0.425) 0.1
 	states_ <- liftIO (ctxStates ctx)
 	ptss_ <- liftIO $ readTVarIO (ctxModuleOutputs ctx)
 	ptss <- liftIO $ for ptss_ $ \(label, ptVar) -> (,) label <$> readTVarIO ptVar
@@ -572,7 +572,7 @@ renderGraph ctx = do
 		Cairo.stroke
 
 		-- label grid lines
-		valignText (-0.3) 0.1 . M.fromList $
+		valignText (-0.25) 0.2 . M.fromList $
 			[ (coordDiffPos t, (tbLabel tb t, "", ""))
 			| t <- [0, tbGridLine tb .. tbMax tb]
 			]
@@ -588,7 +588,7 @@ renderGraph ctx = do
 		Cairo.stroke
 
 		-- label grid lines
-		valignText (-0.2) 0.1 . M.fromList $
+		valignText 1.05 0.2 . M.fromList $
 			[ (yPos (State state), ("", "", state))
 			| state <- M.keys states
 			, isMajor state
