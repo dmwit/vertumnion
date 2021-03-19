@@ -1343,8 +1343,8 @@ synchronousOnlyModule label initialize newDependents
 	meTime (StateChange e) = eTime e
 	meTime (Stop t) = t
 
-eventProgressModule :: Module
-eventProgressModule = synchronousOnlyModule "event progress" def
+stateProgressModule :: Module
+stateProgressModule = synchronousOnlyModule "state progress" def
 	$ \ ~() me -> pure [State (eState e) | StateChange e <- [me]]
 
 timeProgressModule :: Module
@@ -1771,7 +1771,7 @@ pbChanceModule = withRandomRuns "attempts to PB"
 
 -- TODO: make this configurable
 allModules :: [Module]
-allModules = [eventProgressModule, timeProgressModule, percentileModule 0.1, percentileModule 0.9, expectedModule, pbModule, pbChanceModule, currentPointModule]
+allModules = [stateProgressModule, timeProgressModule, percentileModule 0.1, percentileModule 0.9, expectedModule, pbModule, pbChanceModule, currentPointModule]
 
 moduleThread :: Context -> IO loop
 moduleThread ctx = do
