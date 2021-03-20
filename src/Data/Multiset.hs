@@ -23,6 +23,9 @@ import Data.Semigroup
 import Data.Word
 import qualified Data.FingerTree as FT
 
+-- TODO: This is making all the wrong tradeoffs. The common case for our use is
+-- that all the values in the MultiSet will be distinct, and the Word will just
+-- be wasted space.
 data Element a = Element
 	{ eMultiplicity :: Word
 	, eValue :: a
