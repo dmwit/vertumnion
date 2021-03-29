@@ -703,6 +703,7 @@ chooseYScale def fe vai
 	minDY = minimum . ap (zipWith subtract) tail . M.keys $ vai
 	reqDY = Cairo.fontExtentsHeight fe
 
+-- TODO: the smallest (and largest?) state should always be major
 
 data DiffTimeBounds = DiffTimeBounds
 	{ dtbZero :: DiffTimeSpec
