@@ -1041,7 +1041,7 @@ parserThread ctx = DB.connectPostgreSQL (db (ctxConfig ctx)) >>= go where
 				broadcast now Event { eFrame = Just 0, eMicrosecond = 0, eState = state }
 					Nothing
 					(running (negate frame) frame)
-					idling
+					stopping
 			Left (Just now) -> warnIgnoreStop >> idling
 			Left Nothing -> idling
 
