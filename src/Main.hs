@@ -1729,7 +1729,7 @@ percentileModule p_ = withRandomRuns (pString ++ " percentile")
 	(\_ _ _ -> pure ())
 	$ \_ _ _ runs event -> pure . toList $ do
 		dts <- M.lookup (eState event) runs
-		dt <- dts MS.!? round (p * fromIntegral (MS.size dts - 1))
+		dt <- dts MS.!? round ((1-p) * fromIntegral (MS.size dts - 1))
 		pure $ dtPoint event dt
 	where
 	p = min 1 (max 0 p_)
