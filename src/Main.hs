@@ -636,8 +636,6 @@ renderGraph ctx = do
 			Cairo.arc xCoord yCoord 0.03 (angle-dAngle) (angle+dAngle)
 		Cairo.fill
 
-	Cairo.setSourceRGB 0 0 0
-
 valignText :: (Cairo.CairoString string, IsString string, Monoid string) =>
 	Double -> Double -> Map Double (string, string, string) -> Render ()
 valignText x w entries_ = do
