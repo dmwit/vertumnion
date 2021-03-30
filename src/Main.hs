@@ -1621,7 +1621,7 @@ runGenerationThread ctx cmds = do
 	where
 	runTVar = ctxRandomRuns ctx
 	target = pTarget (ctxProfile ctx)
-	maxRunCount = 1000 -- TODO: configurable
+	maxRunCount = 5000 -- TODO: configurable
 
 	waiting conn = do
 		cmd <- readChan cmds
