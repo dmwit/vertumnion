@@ -58,6 +58,7 @@ import System.Environment
 import System.Environment.XDG.BaseDir
 import System.Exit
 import System.FilePath
+import System.Glib.Properties
 import System.Glib.UTFString
 import System.IO
 import System.Posix.Process (getProcessID)
@@ -91,13 +92,14 @@ import qualified Text.PrettyPrint.ANSI.Leijen as Doc
 main :: IO ()
 main = do
 	ctx <- initializeContext
-	traverse_ (\thread -> forkIO (thread ctx)) [loggingThread, stdinThread, parserThread, heartbeatThread, moduleThread]
+	traverse_ (\thread -> forkIO (thread ctx)) [loggingThread, stdinThread, parserThread, heartbeatThread, moduleThread, preferencesThread]
 	guiThread ctx -- NB not forked
 	-- TODO: maybe stay open and start ignoring stdin, so that pipes don't fill up and block producers?
 
 data Context = Context
 	{ ctxConfig :: Config
 	, ctxProfile :: Profile
+	, ctxArguments :: Arguments
 	, ctxErrors :: Chan String
 	, ctxInput :: Chan (TimeSpec, Text)
 	-- TODO: since this is only written from parserThread (right?) it can probably be an IORef
@@ -111,14 +113,15 @@ data Context = Context
 	, ctxStateRange :: TVar StateRange
 	-- the Word is an epoch, used as an equality-check fast path
 	, ctxRandomRuns :: TVar (Word, Runs)
+	, ctxPreferences :: TChan Preferences
 	}
 
 initializeContext :: IO Context
 initializeContext = do
 	argumentParser <- mkArgumentParser
-	args <- execParser argumentParser
-	profile_ <- loadProfile (argProfile args)
-	let profile = profile_ { pTarget = fromMaybe (pTarget profile_) (argTargetOverride args) }
+	arguments <- execParser argumentParser
+	profile_ <- loadProfile (argProfile arguments)
+	let profile = profile_ { pTarget = fromMaybe (pTarget profile_) (argTargetOverride arguments) }
 	config <- loadConfig
 	errors <- newChan
 	input <- newChan
@@ -136,9 +139,11 @@ initializeContext = do
 		, srMax = pTarget profile
 		}
 	randomRuns <- newTVarIO (0, M.empty)
+	preferences <- newTChanIO
 	pure Context
 		{ ctxConfig = config
 		, ctxProfile = profile
+		, ctxArguments = arguments
 		, ctxErrors = errors
 		, ctxInput = input
 		, ctxUITimerLabelStatus = uiTimerLabelStatus
@@ -150,6 +155,7 @@ initializeContext = do
 		, ctxEventStore = eventStore
 		, ctxStateRange = stateRange
 		, ctxRandomRuns = randomRuns
+		, ctxPreferences = preferences
 		}
 
 data Config = Config
@@ -240,6 +246,20 @@ profileSpec = C.sectionsSpec "profile" $ pure Profile
 		<!> (Hours <$ C.atomSpec "hours")
 		<!> (Days <$> C.anySpec)
 
+preferencesSpec :: C.ValueSpec Preferences
+preferencesSpec = C.sectionsSpec "preferences" $ pure Preferences
+	<*> C.reqSection' "window" rectangleSpec "request that the window manager initially place the window with this geometry"
+	<*> C.reqSection' "splits" splitsSpec "set the initial size of the splits pane"
+	<*> C.reqSection' "graph" graphSpec "set the initial size of the graph pane"
+	where
+	rectangleSpec = C.sectionsSpec "window" $ pure Rectangle
+		<*> C.reqSection "x" ""
+		<*> C.reqSection "y" ""
+		<*> C.reqSection "width" ""
+		<*> C.reqSection "height" ""
+	splitsSpec = C.sectionsSpec "splits" $ C.reqSection "height" ""
+	graphSpec = C.sectionsSpec "graph" $ C.reqSection "width" ""
+
 -- TODO: uh, system paths?
 configPath :: FilePath -> IO FilePath
 configPath name = (</> name) <$> getUserConfigDir "vertumnion"
@@ -252,6 +272,9 @@ configName = configPath "config"
 
 logDir :: IO FilePath
 logDir = getUserStateDir "vertumnion"
+
+preferencesDir :: IO FilePath
+preferencesDir = configPath "preferences"
 
 loadSchema :: FilePath -> Handle -> C.ValueSpec a -> IO a
 loadSchema fp h spec = do
@@ -292,8 +315,16 @@ loadConfig = do
 	fp <- configName
 	mh <- try (openFile fp ReadMode)
 	case mh of
-		Left (e :: IOError) -> pure def
+		Left (e :: IOError) -> def
 		Right h -> loadSchema fp h configSpec
+
+loadPreferences :: String -> IO (Maybe Preferences)
+loadPreferences profile = do
+	fp <- (</> profile) <$> preferencesDir
+	mh <- try (openFile fp ReadMode)
+	case mh of
+		Left (e :: IOError) -> def
+		Right h -> Just <$> loadSchema fp h preferencesSpec
 
 data Arguments = Arguments
 	{ argProfile :: FilePath
@@ -325,21 +356,48 @@ mkArgumentParser = do
 usage :: IO String
 usage = do
 	prog <- getProgName
-	dir <- profileDir
+	profDir <- profileDir
+	prefDir <- preferencesDir
 	fp <- configName
 	pure . unlines . tail $ [undefined
-		, "PROFILE refers to a file in " ++ dir ++ "."
-		, "The profile should be in config-value format and use the UTF-8 encoding."
-		, "See here for details:"
+		, "All files processed by vertumnion should be in config-value format and use the"
+		, "UTF-8 encoding. See here for details:"
 		, "http://hackage.haskell.org/package/config-value/docs/Config.html"
 		, ""
+		, "PROFILE refers to a file in " ++ profDir ++ "."
 		, "The profile should conform to the following format."
 		, show (C.generateDocs profileSpec)
+		, ""
+		, "Preferences will be loaded if they are available. They may be placed in a file"
+		, "with the same profile name in " ++ prefDir ++ "."
+		, "This file will automatically be created or overwritten during program execution."
+		, "The preferences should conform to the following format."
+		, show (C.generateDocs preferencesSpec)
 		, ""
 		, "A configuration file is also read from " ++ fp ++ "."
 		, "It is similarly a UTF-8 encoded config-value file, with the following format."
 		, show (C.generateDocs configSpec)
 		]
+
+data Preferences = Preferences
+	{ windowRectangle :: Rectangle
+	, splitHeight :: Int
+	, graphWidth :: Int
+	} deriving (Eq, Show)
+
+scheduleSavePreferences ::
+	(WindowClass window, PanedClass graphPane, PanedClass dataPane) =>
+	Context -> window -> graphPane -> dataPane -> IO ()
+scheduleSavePreferences ctx window graphPane dataPane = liftIO $ do
+	(x, y) <- windowGetPosition window
+	(w, h) <- windowGetSize window
+	sh <- panedGetPosition dataPane
+	gw <- panedGetPosition graphPane
+	atomically $ writeTChan (ctxPreferences ctx) Preferences
+		{ windowRectangle = Rectangle x y w h
+		, splitHeight = sh
+		, graphWidth = gw
+		}
 
 loggingThread :: Context -> IO loop
 loggingThread (ctxErrors -> chan) = do
@@ -405,21 +463,6 @@ guiThread ctx = do
 					redrawAllIntervals ctx
 				pure content
 
-	-- TODO: set minimum height to (length (major events) + 1) * height of one row
-	-- Hmm... from reading online a bit, there doesn't seem to be a really
-	-- great way to do this. Approaches:
-	--
-	-- * widgetSetSizeRequest -- can't resize the widget below this size
-	-- * scrolledWindowMinContentHeight -- can't resize the widget below this size
-	-- * windowSetDefaultSize -- kinda want to use the computed size of the
-	--   other widgets in the window, but that computation isn't done until the
-	--   window is shown, and after that the default size is ignored
-	-- * treeStoreInsertForest (to add blank rows and reserve space) -- the
-	--   ScrolledWindow doesn't pay attention to its child's size at all
-	-- * sizeRequest -- this is an invalid signal for ScrolledWindows
-	--
-	-- Possible way forward: record what size the user put the window at last
-	-- time they used this profile.
 	eventLogScroll <- scrolledWindowNew Nothing Nothing
 	set eventLogScroll [containerChild := eventLog, scrolledWindowHscrollbarPolicy := PolicyNever]
 	eventLogAdjustment <- scrolledWindowGetVAdjustment eventLogScroll
@@ -443,6 +486,20 @@ guiThread ctx = do
 	boxPackStart vbox targetLabel PackNatural 0
 	boxPackStart vbox (ctxUITimerLabel ctx) PackNatural 0
 	boxPackStart vbox dataPane PackGrow 0
+
+	mprefs <- loadPreferences (argProfile (ctxArguments ctx))
+	for_ mprefs $ \prefs -> do
+		let Rectangle x y w h = windowRectangle prefs
+		windowSetDefaultSize window w h
+		windowMove window x y
+		panedSetPosition dataPane (splitHeight prefs)
+		panedSetPosition graphPane (graphWidth prefs)
+
+	let ssp = scheduleSavePreferences ctx window graphPane dataPane
+	on window configureEvent (False <$ liftIO ssp)
+	on graphPane (notifyProperty panedPosition') ssp
+	on dataPane  (notifyProperty panedPosition') ssp
+
 	widgetShowAll window
 	mainGUI
 
@@ -893,6 +950,11 @@ showDigitsScientific (mantissa, exponent) = go mantissa exponent "" where
 	go m e suf
 		| abs m < 10 = (show m ++ ['.' | not (null suf)] ++ suf, "e", show e)
 		| otherwise = let (q, r) = m `quotRem` 10 in go q (e+1) (intToDigit (abs r) : suf)
+
+-- The panedPosition offered by the library seems to be implemented in some
+-- roundabout way that doesn't let notifyProperty work right.
+panedPosition' :: PanedClass self => Attr self Int
+panedPosition' = newAttrFromIntProperty "position"
 
 -- | The 'Word8' is how many digits there are.
 data TimeMagnitude = Seconds | Minutes | Hours | Days Word8 deriving (Eq, Ord, Read, Show)
@@ -1793,3 +1855,63 @@ moduleThread ctx = do
 	forever $ do
 		mEvent <- readChan (ctxModuleInput ctx)
 		for_ (chan:chans) $ \chan -> writeChan chan mEvent
+
+-- TODO: should we have an MVar or something so the main thread can wait till
+-- this finishes?
+preferencesThread :: Context -> IO loop
+preferencesThread ctx = do
+	initialPreferences <- loadPreferences (argProfile (ctxArguments ctx))
+	go $ fromMaybe impossiblePrefs initialPreferences
+	where
+	go prefs = do
+		prefs' <- debounceReadTChanIO (ctxPreferences ctx)
+		when (prefs /= prefs') (savePreferences ctx prefs')
+		go prefs'
+
+	impossiblePrefs = Preferences
+		{ windowRectangle = Rectangle (-1) (-1) (-1) (-1)
+		, splitHeight = -1
+		, graphWidth = -1
+		}
+
+debounceReadTChanIO :: TChan a -> IO a
+debounceReadTChanIO chan = atomically (readTChan chan) >>= go where
+	go a = do
+		threadDelay 5000000 -- 5-10 seconds after the last mouse movement ought to be soon enough
+		(continue, a') <- atomically (emptyTChan chan a)
+		(if continue then go else pure) a'
+
+emptyTChan :: TChan a -> a -> STM (Bool, a)
+emptyTChan chan = go False where
+	go haveRead res = tryReadTChan chan >>= \case
+		Nothing -> pure (haveRead, res)
+		Just res' -> go True res'
+
+savePreferences :: Context -> Preferences -> IO ()
+savePreferences ctx prefs = do
+	dir <- preferencesDir
+	let fp = dir </> argProfile (ctxArguments ctx)
+	    write = do
+	    	createDirectoryIfMissing True dir
+	    	writeFile fp (preferencesToString prefs)
+
+	    complain :: IOException -> IO ()
+	    complain err = do
+	    	writeChan (ctxErrors ctx) $ printf
+	    		"Error while attempting to write preferences to %s (will retry at next change): %s"
+	    		fp (displayException err)
+	catch write complain
+
+preferencesToString :: Preferences -> String
+preferencesToString = flip shows "\n" . C.pretty . preferencesToValue where
+	preferencesToValue (Preferences (Rectangle x y w h) sh gw) = C.Sections ()
+		[ C.Section () "window" $ C.Sections ()
+			[ intSection "x" x
+			, intSection "y" y
+			, intSection "width" w
+			, intSection "height" h
+			]
+		, C.Section () "splits" $ C.Sections () [intSection "height" sh]
+		, C.Section () "graph" $ C.Sections () [intSection "width" gw]
+		]
+	intSection nm = C.Section () nm . C.Number () . C.integerToNumber . toInteger
