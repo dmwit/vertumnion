@@ -19,6 +19,7 @@ import qualified Text.PrettyPrint.ANSI.Leijen as Doc
 main :: IO ()
 main = do
 	hSetBuffering stdin LineBuffering
+	hSetBuffering stdout LineBuffering
 	argumentParser <- mkArgumentParser
 	arguments <- execParser argumentParser
 	profile <- loadProfile (argProfile arguments) (argTargetOverride arguments)
