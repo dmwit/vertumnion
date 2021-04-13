@@ -20,6 +20,7 @@ extra-source-files:  CHANGELOG.md src/schema.sql
 executable vertumnion
   main-is:             vertumnion.hs
   other-modules:       Data.Multiset
+                       Vertumnion.Shared
   -- other-extensions:
   build-depends:       base ^>=4.12.0.0
                        , ansi-wl-pprint ^>=0.6
@@ -52,3 +53,21 @@ executable vertumnion
   hs-source-dirs:      src
   default-language:    Haskell2010
   ghc-options:         -threaded -fno-warn-tabs -with-rtsopts=-N3
+
+executable vertilinous
+  main-is:             vertilinous.hs
+  other-modules:       Vertumnion.Shared
+  build-depends:       base ^>=4.12.0.0
+                       , ansi-wl-pprint ^>=0.6
+                       , config-schema ^>=1.2
+                       , config-value ^>=0.8
+                       , containers ^>=0.6
+                       , filepath ^>=1.4
+                       , optparse-applicative ^>=0.15
+                       , ordered-containers ^>=0.2
+                       , semigroupoids ^>=5.3
+                       , text ^>=1.2
+                       , xdg-basedir ^>=0.2
+  hs-source-dirs:      src
+  default-language:    Haskell2010
+  ghc-options:         -fno-warn-tabs

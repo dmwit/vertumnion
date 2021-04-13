@@ -16,7 +16,6 @@ import Control.DeepSeq
 import Control.Exception
 import Control.Monad
 import Control.Monad.IO.Class
-import Data.Bifunctor
 import Data.Bits
 import Data.ByteString (ByteString)
 import Data.Char
@@ -46,17 +45,14 @@ import Data.Time.Calendar.OrdinalDate
 import Data.Traversable
 import Data.Vector (Vector)
 import Data.Void
-import Data.Word
 import Database.PostgreSQL.Simple (Connection)
 import Graphics.Rendering.Cairo (Render)
 import Graphics.UI.Gtk
-import Numeric.Natural
 import Options.Applicative
 import System.Clock (Clock(..), TimeSpec(..), getTime)
 import System.Directory
 import System.Environment
 import System.Environment.XDG.BaseDir
-import System.Exit
 import System.FilePath
 import System.Glib.Properties
 import System.Glib.UTFString
@@ -64,9 +60,9 @@ import System.IO
 import System.Posix.Process (getProcessID)
 import System.Random
 import Text.Printf (printf)
+import Vertumnion.Shared
 import qualified Config as C
 import qualified Config.Schema as C
-import qualified Config.Macro as C
 import qualified Data.ByteString as BS
 import qualified Data.Map as M
 import qualified Data.Map.Strict as M.S
@@ -120,8 +116,7 @@ initializeContext :: IO Context
 initializeContext = do
 	argumentParser <- mkArgumentParser
 	arguments <- execParser argumentParser
-	profile_ <- loadProfile (argProfile arguments)
-	let profile = profile_ { pTarget = fromMaybe (pTarget profile_) (argTargetOverride arguments) }
+	profile <- loadProfile (argProfile arguments) (argTargetOverride arguments)
 	config <- loadConfig
 	errors <- newChan
 	input <- newChan
@@ -167,7 +162,7 @@ instance Default Config where
 		{ db = "dbname=vertumnion"
 		}
 
-configSpec :: C.ValueSpec Config
+configSpec :: ValueSpec Config
 configSpec = C.sectionsSpec
 	"configuration"
 	(config <$> C.optSection "db" help)
@@ -178,19 +173,7 @@ configSpec = C.sectionsSpec
 		}
 	help = "A postgres connection string for storing splits (default: dbname=vertumnion)"
 
-data Profile = Profile
-	{ pGame :: Text
-	, pFPS :: Maybe Double
-	, pTarget :: Text
-	, pMajorStates :: Maybe (Set Text)
-	, pSortOrder :: SortOrder
-	, pDurationHint :: TimeMagnitude
-	} deriving (Eq, Ord, Read, Show)
-
 type ID = Int32
-
-data SortOrder = Ascending | Descending | AscendingOn (OSet Text)
-	deriving (Eq, Ord, Read, Show)
 
 soCompare :: SortOrder -> Text -> Text -> Ordering
 soCompare Ascending t t' = compare t t'
@@ -208,45 +191,10 @@ soMin so t t' = if soLt so t t' then t else t'
 soMax :: SortOrder -> Text -> Text -> Text
 soMax so t t' = if soLt so t t' then t' else t
 
-soAllStates :: SortOrder -> Maybe (OSet Text)
-soAllStates (AscendingOn ss) = Just ss
--- not a catch-all pattern because I want compiler warnings if constructors get
--- added later
-soAllStates Ascending = Nothing
-soAllStates Descending = Nothing
-
 ctxAllStates :: Context -> Maybe (OSet Text)
 ctxAllStates = soAllStates . pSortOrder . ctxProfile
 
-defaultableSection :: Text -> Text -> ValueSpec a -> Text -> SectionsSpec (Maybe a)
-defaultableSection sec atom spec help = join <$> C.optSection' sec
-	(   (Nothing <$ C.atomSpec atom)
-	<!> (Just <$> spec)
-	) (help <> " (default: " <> atom <> ")")
-
-profileSpec :: C.ValueSpec Profile
-profileSpec = C.sectionsSpec "profile" $ pure Profile
-	<*> C.reqSection' "game" textSpec "Which game you are playing (will be used as database key)"
-	<*> defaultableSection "fps" "variable" C.anySpec "The typical framerate of the game"
-	<*> C.reqSection' "target" textSpec "The winning state for this game, to stop the timer at"
-	<*> defaultableSection "major" "all" statesSpec "A list of major states that you want to be given special status in the UI. As a rule of thumb, pick the states that every run has to go through to win"
-	<*> (fromMaybe Ascending <$> C.optSection' "order" orderSpec "When the UI must list states in order, what order shall it use? If you give a list of states, they will be put in exactly that order and other states will be discarded (default: ascending)")
-	<*> (fromMaybe Seconds <$> C.optSection' "duration" durationSpec "A hint about how long full runs typically take. If this is a number n, that means 10^n days (default: seconds)")
-	where
-	textSpec = C.anyAtomSpec <!> C.textSpec
-	statesSpec = S.fromList <$> C.listSpec textSpec
-	indexMap = AscendingOn . O.fromList
-	orderSpec =
-		    (Ascending <$ C.atomSpec "ascending")
-		<!> (Descending <$ C.atomSpec "descending")
-		<!> (indexMap <$> C.listSpec textSpec)
-	durationSpec =
-		    (Seconds <$ C.atomSpec "seconds")
-		<!> (Minutes <$ C.atomSpec "minutes")
-		<!> (Hours <$ C.atomSpec "hours")
-		<!> (Days <$> C.anySpec)
-
-preferencesSpec :: C.ValueSpec Preferences
+preferencesSpec :: ValueSpec Preferences
 preferencesSpec = C.sectionsSpec "preferences" $ pure Preferences
 	<*> C.reqSection' "window" rectangleSpec "request that the window manager initially place the window with this geometry"
 	<*> C.reqSection' "splits" splitsSpec "set the initial size of the splits pane"
@@ -260,55 +208,11 @@ preferencesSpec = C.sectionsSpec "preferences" $ pure Preferences
 	splitsSpec = C.sectionsSpec "splits" $ C.reqSection "height" ""
 	graphSpec = C.sectionsSpec "graph" $ C.reqSection "width" ""
 
--- TODO: uh, system paths?
-configPath :: FilePath -> IO FilePath
-configPath name = (</> name) <$> getUserConfigDir "vertumnion"
-
-profileDir :: IO FilePath
-profileDir = configPath "profiles"
-
-configName :: IO FilePath
-configName = configPath "config"
-
 logDir :: IO FilePath
 logDir = getUserStateDir "vertumnion"
 
 preferencesDir :: IO FilePath
 preferencesDir = configPath "preferences"
-
-loadSchema :: FilePath -> Handle -> C.ValueSpec a -> IO a
-loadSchema fp h spec = do
-	hSetEncoding h utf8
-	t <- T.hGetContents h
-	v <- case C.parse t of
-		Left err -> die . (("Error while parsing " ++ fp ++ ":\n") ++) . displayException $ err
-		Right v -> pure (C.FilePosition fp <$> v)
-	hClose h
-	either (die . displayException) pure (C.loadValue spec v)
-
-loadProfile :: String -> IO Profile
-loadProfile profile = do
-	fp <- (</> profile) <$> profileDir
-	h <- openFile fp ReadMode
-	p <- loadSchema fp h profileSpec
-	sanityCheckProfile p
-
-sanityCheckProfile :: Profile -> IO Profile
-sanityCheckProfile p
-	| Just tags <- soAllStates (pSortOrder p)
-	, Just states <- pMajorStates p
-	, any (`O.notMember` tags) states = fail $ ""
-		++ "Error in profile: these major states do not appear in the sort order:"
-		++ [ c
-		   | state <- S.toAscList states
-		   , state `O.notMember` tags
-		   , c <- "\n\t" ++ T.unpack state
-		   ]
-sanityCheckProfile p
-	| Just tags <- soAllStates (pSortOrder p)
-	, pTarget p `O.notMember` tags
-	= fail "Error in profile: target does not appear in the sort order"
-sanityCheckProfile p = pure p
 
 loadConfig :: IO Config
 loadConfig = do
@@ -360,7 +264,7 @@ usage = do
 	prefDir <- preferencesDir
 	fp <- configName
 	pure . unlines . tail $ [undefined
-		, "All files processed by vertumnion should be in config-value format and use the"
+		, "All files processed by " ++ prog ++ " should be in config-value format and use the"
 		, "UTF-8 encoding. See here for details:"
 		, "http://hackage.haskell.org/package/config-value/docs/Config.html"
 		, ""
@@ -956,9 +860,6 @@ showDigitsScientific (mantissa, exponent) = go mantissa exponent "" where
 panedPosition' :: PanedClass self => Attr self Int
 panedPosition' = newAttrFromIntProperty "position"
 
--- | The 'Word8' is how many digits there are.
-data TimeMagnitude = Seconds | Minutes | Hours | Days Word8 deriving (Eq, Ord, Read, Show)
-
 updateTimerLabel :: Context -> IO ()
 updateTimerLabel ctx = postGUIAsync $ do
 	status <- readMVar (ctxUITimerLabelStatus ctx)
@@ -1254,23 +1155,6 @@ logEvent ctx e = do
 			else do
 				treeStoreRemove store [n]
 				removeMinorEvents major (e':minor) (n-1)
-
-data HumanOrder = HumanOrder
-	{ unHumanOrder :: Text
-	, parsedHumanOrder :: [Either Natural Text]
-	}
-
-humanOrder :: Text -> HumanOrder
-humanOrder t = HumanOrder t (map parse groups) where
-	groups = T.groupBy (\c c' -> isDigit c == isDigit c') t
-	parse t = case T.decimal t of
-		Right (n, t') | T.null t' -> Left n
-		_ -> Right t
-
-instance Eq HumanOrder where h == h' = unHumanOrder h == unHumanOrder h'
-instance Ord HumanOrder where compare h h' = compare (parsedHumanOrder h) (parsedHumanOrder h')
-instance Read HumanOrder where readsPrec n s = map (first humanOrder) (readsPrec n s)
-instance Show HumanOrder where show = show . unHumanOrder
 
 class Ord a => IsText a where
 	fromText :: Text -> a
