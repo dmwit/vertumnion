@@ -55,9 +55,9 @@ loadProfile :: String -> Maybe Text -> IO Profile
 loadProfile profile targetOverride = do
 	fp <- (</> profile) <$> profileDir
 	h <- openFile fp ReadMode
-	p <- loadSchema fp h profileSpec
-	sanityCheckProfile p
-	pure p { pTarget = fromMaybe (pTarget p) targetOverride }
+	p_ <- loadSchema fp h profileSpec
+	let p = p_ { pTarget = fromMaybe (pTarget p_) targetOverride }
+	p <$ sanityCheckProfile p
 
 loadSchema :: FilePath -> Handle -> C.ValueSpec a -> IO a
 loadSchema fp h spec = do
