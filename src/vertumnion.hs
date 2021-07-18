@@ -130,8 +130,8 @@ initializeContext = do
 	eventStore <- treeStoreNew []
 	stateRange <- newTVarIO StateRange
 		{ srStateCache = Uninitialized
-		, srMin = pTarget profile
-		, srMax = pTarget profile
+		, srMin = humanOrder (pTarget profile)
+		, srMax = humanOrder (pTarget profile)
 		}
 	randomRuns <- newTVarIO (0, M.empty)
 	preferences <- newTChanIO
@@ -175,20 +175,20 @@ configSpec = C.sectionsSpec
 
 type ID = Int32
 
-soCompare :: SortOrder -> Text -> Text -> Ordering
+soCompare :: SortOrder -> HumanOrder -> HumanOrder -> Ordering
 soCompare Ascending t t' = compare t t'
 soCompare Descending t t' = compare t' t
-soCompare (AscendingOn ts) t t' = case (O.findIndex t ts, O.findIndex t' ts) of
+soCompare (AscendingOn ts) t t' = case (O.findIndex (toText t) ts, O.findIndex (toText t') ts) of
 	(Just i, Just i') -> compare i i'
 	_ -> compare t t'
 
-soLt :: SortOrder -> Text -> Text -> Bool
+soLt :: SortOrder -> HumanOrder -> HumanOrder -> Bool
 soLt so t t' = soCompare so t t' == LT
 
-soMin :: SortOrder -> Text -> Text -> Text
+soMin :: SortOrder -> HumanOrder -> HumanOrder -> HumanOrder
 soMin so t t' = if soLt so t t' then t else t'
 
-soMax :: SortOrder -> Text -> Text -> Text
+soMax :: SortOrder -> HumanOrder -> HumanOrder -> HumanOrder
 soMax so t t' = if soLt so t t' then t' else t
 
 ctxAllStates :: Context -> Maybe (OSet Text)
@@ -1185,27 +1185,32 @@ stateCache ctx ss = case pSortOrder (ctxProfile ctx) of
 
 data StateRange = StateRange
 	{ srStateCache :: StateCache
-	, srMin :: Text
-	, srMax :: Text
+	, srMin :: HumanOrder
+	, srMax :: HumanOrder
 	}
 
+srMinT, srMaxT :: StateRange -> Text
+srMinT = toText . srMin
+srMaxT = toText . srMax
+
 srInsert :: SortOrder -> Text -> StateRange -> (Any, StateRange)
-srInsert so t sr = pure StateRange
+srInsert so t_ sr = pure StateRange
 	<*> case srStateCache sr of
-		Sorted ts -> (Any (S.notMember t' ts), Sorted (S.insert t' ts)) where t' = fromText t
+		Sorted ts -> (Any (S.notMember t' ts), Sorted (S.insert t' ts)) where t' = fromText t_
 		_ -> (Any False, srStateCache sr) -- slightly optimistic... if it's Ordered, assumes t appears in the OSet
 	<*> (Any (soLt so t (srMin sr)), soMin so t (srMin sr))
 	<*> (Any (soLt so (srMax sr) t), soMax so t (srMax sr))
+	where t = humanOrder t_
 
 ctxStates :: Context -> IO [Text]
 ctxStates ctx = do
 	sr <- readTVarIO (ctxStateRange ctx)
 	case srStateCache sr of
-		Ordered ss -> case (O.findIndex (srMin sr) ss, O.findIndex (srMax sr) ss) of
+		Ordered ss -> case (O.findIndex (srMinT sr) ss, O.findIndex (srMaxT sr) ss) of
 			(Just iMin, Just iMax) -> pure [fromJust (ss `O.elemAt` i) | i <- [iMin .. iMax]]
 			_ -> failedRange sr $ printf "StateRange bounds %s-%s not found in StateCache %s"
-				(show (srMin sr))
-				(show (srMax sr))
+				(show (srMinT sr))
+				(show (srMaxT sr))
 				(show ss)
 		Sorted ss -> case (S.lookupIndex eMin ss, S.lookupIndex eMax ss) of
 			(Just iMin, Just iMax) -> pure
@@ -1215,18 +1220,17 @@ ctxStates ctx = do
 				. S.drop iMin
 				$ ss
 			_ -> failedRange sr $ printf "StateRange bounds %s-%s not found in StateCache %s"
-				(show (srMin sr))
-				(show (srMax sr))
+				(show (srMinT sr))
+				(show (srMaxT sr))
 				(show (S.map toText ss))
 			where
-			eMin = fromText (srMin sr)
-			eMax = fromText (srMax sr)
+			eMin = fromText (srMinT sr)
+			eMax = fromText (srMaxT sr)
 		Uninitialized -> do
 			mCache <- initializeStateCache ctx
 			cache <- case mCache of
-				Nothing -> do
+				Nothing -> stateCache ctx <$>
 					failedRange sr "Could not contact database to initialize state cache"
-					pure (stateCache ctx [srMin sr, srMax sr])
 				Just cache -> pure cache
 			atomically $ do
 				sr' <- readTVar (ctxStateRange ctx)
@@ -1235,7 +1239,7 @@ ctxStates ctx = do
 	where
 	failedRange sr err = do
 		writeChan (ctxErrors ctx) err
-		pure $ [srMin sr | srMin sr /= srMax sr] ++ [srMax sr]
+		pure $ [srMinT sr | srMin sr /= srMax sr] ++ [srMaxT sr]
 
 initializeStateCache :: Context -> IO (Maybe StateCache)
 initializeStateCache ctx = case pSortOrder (ctxProfile ctx) of
