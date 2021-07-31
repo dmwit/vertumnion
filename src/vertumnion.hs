@@ -46,6 +46,7 @@ import Data.Traversable
 import Data.Vector (Vector)
 import Data.Void
 import Database.PostgreSQL.Simple (Connection)
+import GHC.Read
 import Graphics.Rendering.Cairo (Render)
 import Graphics.UI.Gtk
 import Options.Applicative
@@ -60,6 +61,8 @@ import System.IO
 import System.Posix.Process (getProcessID)
 import System.Random
 import Text.Printf (printf)
+import Text.Read
+import Text.Read.Lex
 import Vertumnion.Shared
 import qualified Config as C
 import qualified Config.Schema as C
@@ -174,6 +177,12 @@ configSpec = C.sectionsSpec
 	help = "A postgres connection string for storing splits (default: dbname=vertumnion)"
 
 type ID = Int32
+
+soSort :: SortOrder -> [Text] -> [Text]
+soSort = \case
+	Ascending -> sortOn humanOrder
+	Descending -> sortOn (Down . humanOrder)
+	AscendingOn ts -> sortOn (\t -> (O.findIndex t ts, humanOrder t))
 
 soCompare :: SortOrder -> HumanOrder -> HumanOrder -> Ordering
 soCompare Ascending t t' = compare t t'
@@ -898,7 +907,7 @@ updateGraph = postGUIAsync . widgetQueueDraw . ctxUIGraph
 
 -- TODO: Read and Show instances that put the decimal point in the right place
 newtype DiffTimeSpec = DiffTimeSpec { getMicros :: Int64 }
-	deriving (Eq, Ord, Read, Show, Enum, DB.FromField, DB.ToField, NFData)
+	deriving (Bounded, Eq, Ord, DB.FromField, DB.ToField, NFData)
 
 -- | @fromInteger 1@ is one second
 instance Num DiffTimeSpec where
@@ -914,13 +923,54 @@ instance Real DiffTimeSpec where
 	toRational (DiffTimeSpec a) = toRational a / 1000000
 
 instance Fractional DiffTimeSpec where
-	DiffTimeSpec a / DiffTimeSpec b = DiffTimeSpec ((a*1000000 + b `div` 2) `div` b)
-	recip (DiffTimeSpec a) = DiffTimeSpec ((1000000000000 + a `div` 2) `div` a)
+	DiffTimeSpec a / DiffTimeSpec b = DiffTimeSpec (fromInteger ((a'*1000000 + b' `div` 2) `div` b')) where
+		a' = toInteger a
+		b' = toInteger b
+	recip (DiffTimeSpec a) = DiffTimeSpec (fromInteger ((1000000000000 + a' `div` 2) `div` a')) where
+		a' = toInteger a
 	fromRational n = DiffTimeSpec (round (n*1000000))
 
 instance RealFrac DiffTimeSpec where
 	properFraction (DiffTimeSpec a) = (fromIntegral q, DiffTimeSpec r) where
 		(q, r) = a `quotRem` 1000000
+
+instance Enum DiffTimeSpec where
+	succ (DiffTimeSpec a) = if a > maxBound - 1000000
+		then error $ "DiffTimeSpec.succ: bad argument " ++ show a
+		else DiffTimeSpec (a+1000000)
+	pred (DiffTimeSpec a) = if a < minBound + 1000000
+		then error $ "DiffTimeSpec.pred: bad argument " ++ show a
+		else DiffTimeSpec (a-1000000)
+
+	toEnum = coerce (toEnum :: Int -> Int64)
+	fromEnum = coerce (int64 fromEnum)
+
+	enumFrom (DiffTimeSpec a) = coerce [a, a+1000000 ..]
+	enumFromThen = coerce (int64 enumFromThen)
+	enumFromTo (DiffTimeSpec a) (DiffTimeSpec b) = coerce [a, a+1000000 .. b]
+	enumFromThenTo = coerce (int64 enumFromThenTo)
+
+instance Show DiffTimeSpec where
+	show (DiffTimeSpec a) = concat . tail $ [undefined
+		, if a < 0 then "-" else ""
+		, show (abs q)
+		, "."
+		, pad (show (abs r))
+		] where
+		(q, r) = a `quotRem` 1000000
+		pad s = replicate (6-length s) '0' ++ s
+
+instance Read DiffTimeSpec where
+	readPrec = readNumber $ \case
+		Number n -> maybe (fail "not a number") convertDTS $ numberToFixed 6 n
+		_ -> fail "not a number"
+		where
+		convertDTS (secs, micros) = pure . DiffTimeSpec . fromInteger $
+			secs*1000000 + signum secs*micros
+
+{-# INLINE int64 #-}
+int64 :: (Int64 -> a) -> Int64 -> a
+int64 f = f
 
 diffTimeSpec :: TimeSpec -> TimeSpec -> DiffTimeSpec
 diffTimeSpec (TimeSpec s ns) (TimeSpec s' ns') = DiffTimeSpec $
