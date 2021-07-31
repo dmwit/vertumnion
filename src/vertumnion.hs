@@ -37,6 +37,7 @@ import Data.Maybe
 import Data.Monoid
 import Data.Multiset (Multiset)
 import Data.Ord
+import Data.Semigroup
 import Data.Set (Set)
 import Data.Set.Ordered (OSet)
 import Data.Text (Text)
@@ -1648,7 +1649,9 @@ runGenerationThread ctx cmds = do
 			Stop{} -> waiting conn
 			StateChange e -> generating conn segs (eState e)
 
-randomRun :: Map Text [Segment] -> Text -> Text -> IO [(Text, DiffTimeSpec)]
+type Run = [(Text, DiffTimeSpec)]
+
+randomRun :: Map Text [Segment] -> Text -> Text -> IO Run
 randomRun segMap_ tgt = go 0 [] where
 	segMap = V.fromList <$> segMap_
 	go t prev s
@@ -1660,7 +1663,7 @@ randomRun segMap_ tgt = go 0 [] where
 			Nothing -> pure prev'
 		where prev' = (s,t):prev
 
-addRun :: [(Text, DiffTimeSpec)] -> Runs -> Runs
+addRun :: Run -> Runs -> Runs
 addRun [] runs = runs
 addRun es@((_, t):_) runs = M.S.unionWith MS.union newRuns runs where
 	-- const keeps the last (earliest) one in the list if we hit a given state
@@ -1774,9 +1777,149 @@ pbChanceModule = withRandomRuns "attempts to PB"
 			, y = LogScale $ fromIntegral (MS.size dts) / fromIntegral nLT
 			}
 
+strategyModule :: DiffTimeSpec -> Module
+strategyModule tTgt = Module ("optimal strategy for " ++ show tTgt) init where
+	init ctx i o = do
+		conn <- DB.connectPostgreSQL (db (ctxConfig ctx))
+		waiting ctx conn i o
+
+	waiting ctx conn i o = do
+		cmd <- readChan i
+		case cmd of
+			Stop{} -> waiting ctx conn i o
+			StateChange e -> computing ctx conn i o (eState e)
+
+	computing ctx conn i o src = do
+		segs <- finishableSegments ctx <$> allSplits ctx conn
+		runs <- forM [1..5000] $ \i -> do
+			atomically (writeTVar o [ModulePoint 0 (LogScale i)])
+			updateGraph ctx
+			randomRun segs (pTarget (ctxProfile ctx)) src
+		let ss = soSort (pSortOrder (ctxProfile ctx)) . nubOrd . map fst . concat $ runs
+		    strat = M.singleton (pTarget (ctxProfile ctx)) tTgt
+		    runSummaries = map summarizeRun runs
+		    winners = [rsStrategy rs | rs <- runSummaries, esFinal (V.last rs) < tTgt]
+		    nTgt = length winners
+		stratss <- fmap concat . forM [nTgt, nTgt-1 .. 1] $ \nSelected ->
+			if chooseInteger nTgt nSelected < 100
+			then pure (chooseList nTgt nSelected winners)
+			else replicateM 100 $ fst <$> foldM
+				(\(chosen, notChosen) nNotChosen -> do
+					n <- randomRIO (0, nNotChosen-1)
+					case splitAt n notChosen of
+						(b, h:e) -> pure (h:chosen, b++e)
+						_ -> (chosen, notChosen) <$ writeChan (ctxErrors ctx)
+							("While choosing a random strategy, we picked index " ++ show n ++ " which apparently is too large for " ++ show notChosen ++ ".")
+				)
+				([], winners)
+				[nTgt, nTgt-1 .. nTgt-nSelected+1]
+		Arg _ strat <- foldM
+			(\bestTStrat (i, strats) -> do
+				let strat = M.unionsWith max strats
+				    tExpected = executeStrategy strat runSummaries
+				    tStrat = Arg tExpected strat
+				if tStrat >= bestTStrat
+					then return bestTStrat
+					else do
+						atomically . writeTVar o $ [ModulePoint t (State s) | (s, t) <- M.toList strat]
+						updateGraph ctx
+						return tStrat
+			)
+			(Arg maxBound M.empty)
+			(zip [0..] stratss)
+		running ctx conn i o strat
+
+	running ctx conn i o strat = readChan i >>= \case
+		Stop{} -> waiting ctx conn i o
+		StateChange{} -> running ctx conn i o strat
+
+chooseInteger :: Int -> Int -> Integer
+chooseInteger n k = product [fromIntegral (n-k+1) .. fromIntegral n] `div` product [2 .. fromIntegral k]
+
+chooseList :: Int -> Int -> [a] -> [[a]]
+chooseList _ 0 _ = [[]]
+chooseList _ _ [] = []
+chooseList n k (x:xs) = case compare n k of
+	LT -> []
+	EQ -> [x:xs]
+	GT -> map (x:) (chooseList (n-1) (k-1) xs) ++ chooseList (n-1) k xs
+
+-- Invariants:
+-- * esFirst is the smallest time in esAll
+-- * esFinal is the biggest time in esAll
+data EventSummary = EventSummary
+	{ esState :: Text
+	, esFirst :: DiffTimeSpec
+	, esFinal :: DiffTimeSpec
+	, esAll :: Set DiffTimeSpec
+	} deriving (Eq, Ord, Read, Show)
+
+-- Invariant: sorted by esFirst, and each esState is unique
+type RunSummary = Vector EventSummary
+
+summarizeRun :: Run -> RunSummary
+summarizeRun = id
+	. V.fromList
+	. sortBy (comparing esFirst)
+	. M.elems
+	. M.fromListWith combine
+	. map inject
+	where
+	inject (s, t) = (s, EventSummary s t t (S.singleton t))
+	combine es es' = es
+		{ esFinal = esFinal es'
+		, esAll = S.union (esAll es) (esAll es')
+		}
+
+type Strategy = Map Text DiffTimeSpec
+
+executeStrategy :: Strategy -> [RunSummary] -> DiffTimeSpec
+executeStrategy strat rss = tTotal / nWins where
+	(Sum nWins, Sum tTotal) = foldMap (executeStrategySingle strat) rss
+
+-- first returned result is 0 for a loss, 1 for a win; second result is time taken
+-- proceeds in three phases:
+-- 1. Find the first time we hit a state that's part of the strategy.
+-- 2. Find the first EventSummary whose final time goes over the strategy time, starting from 1.
+-- 3. Find the earliest death after that, stopping when esFirst is bigger than
+--    our current earliest.
+executeStrategySingle :: Strategy -> RunSummary -> (Sum DiffTimeSpec, Sum DiffTimeSpec)
+executeStrategySingle strat rs = findFirstStrategyState where
+	didEntireRun = (Sum 1, Sum (esFinal (V.last rs)))
+
+	-- phase 1
+	findFirstStrategyState = case V.findIndex (\es -> esState es `M.member` strat) rs of
+		Nothing -> didEntireRun
+		-- The second argument doesn't matter, it will be immediately ignored.
+		-- But we might as well put the right answer in there anyway.
+		Just i -> findFinalDeath i (strat M.! esState (rs V.! i))
+
+	-- phase 2
+	findFinalDeath i tPrev = case rs V.!? i of
+		Nothing -> didEntireRun
+		Just es
+			| esFinal es > t -> findEarliestDeath i t (death t es)
+			| otherwise -> findFinalDeath (i+1) t
+			where
+			t = M.findWithDefault tPrev (esState es) strat
+
+	-- phase 3
+	findEarliestDeath i tStratPrev tDeath = fromMaybe (Sum 0, Sum tDeath) $ do
+		es <- rs V.!? i
+		guard (esFirst es <= tDeath)
+		let tStrat = M.findWithDefault tStratPrev (esState es) strat
+		findEarliestDeath (i+1) tStrat . min tDeath <$> S.lookupGT tStrat (esAll es)
+
+	-- only returns the right answer when there actually is a death
+	death tStrat es = fromMaybe (esFinal es) $ S.lookupGT tStrat (esAll es)
+
+rsStrategy :: RunSummary -> Strategy
+rsStrategy = foldMap (\es -> M.singleton (esState es) (esFinal es))
+
 -- TODO: make this configurable
 allModules :: [Module]
-allModules = [stateProgressModule, percentileModule 0.1, percentileModule 0.9, expectedModule, pbModule, pbChanceModule]
+--allModules = [stateProgressModule, percentileModule 0.1, percentileModule 0.9, expectedModule, pbModule, pbChanceModule]
+allModules = [strategyModule (42*60)]
 
 moduleThread :: Context -> IO loop
 moduleThread ctx = do
